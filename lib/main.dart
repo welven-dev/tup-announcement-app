@@ -1,6 +1,48 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'firebase_options.dart';
 
-void main() => runApp(const TupAnnouncementApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  FirebaseFirestore.instance.settings =
+      const Settings(persistenceEnabled: true);
+  runApp(const TupAnnouncementApp());
+}
+
+const bool kRequireApproval = true;
+
+const kCategories = <String>[
+  'Class Suspension',
+  'Academic Requirements',
+  'Campus Events',
+  'Organization Updates',
+  'Department Notices',
+  'Emergency Alerts',
+];
+
+const kOffices = <String>[
+  'TUP Admin',
+  'OSA',
+  'Registrar',
+  'Student Council',
+  'College Organizations',
+];
+
+const kScopes = <String>['University', 'College', 'Clubs'];
+
+const kRoles = <String>[
+  'School Administrator',
+  'Department Head',
+  'Student Org Officer',
+];
 
 const burgundy = Color(0xFF850018);
 const burgundyDark = Color(0xFF650012);
@@ -9,6 +51,50 @@ const ink = Color(0xFF242124);
 const muted = Color(0xFF777178);
 const line = Color(0xFFECE7E9);
 const canvas = Color(0xFFFFFEFE);
+
+const _months = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+String fmtDate(DateTime d) => '${_months[d.month - 1]} ${d.day}, ${d.year}';
+
+String _ymd(DateTime d) =>
+    '${d.year}${d.month.toString().padLeft(2, '0')}${d.day.toString().padLeft(2, '0')}';
+
+DateTime _endOfDay(DateTime d) => DateTime(d.year, d.month, d.day, 23, 59, 59);
+
+bool hasEnded(DateTime? start, DateTime? end) {
+  final last = end ?? start;
+  if (last == null) return false;
+  return DateTime.now().isAfter(_endOfDay(last));
+}
+
+bool startsLater(DateTime? start) {
+  if (start == null) return false;
+  return DateTime.now().isBefore(DateTime(start.year, start.month, start.day));
+}
+
+Color categoryColor(String category) {
+  switch (category) {
+    case 'Academic Requirements':
+      return burgundy;
+    case 'Class Suspension':
+      return const Color(0xFF7750A3);
+    case 'Emergency Alerts':
+      return const Color(0xFFC62828);
+    case 'Campus Events':
+      return const Color(0xFF1E6FB0);
+    case 'Organization Updates':
+      return const Color(0xFF2E7D6B);
+    default:
+      return const Color(0xFFB56B18);
+  }
+}
+
+void showMsg(BuildContext context, String message) {
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+}
 
 class TupAnnouncementApp extends StatelessWidget {
   const TupAnnouncementApp({super.key});
@@ -37,7 +123,8 @@ class TupAnnouncementApp extends StatelessWidget {
           fillColor: const Color(0xFFF7F4F5),
           hintStyle: const TextStyle(color: muted, fontSize: 13),
           prefixIconColor: muted,
-          contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
           border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(14),
             borderSide: BorderSide.none,
@@ -50,67 +137,169 @@ class TupAnnouncementApp extends StatelessWidget {
 }
 
 class Announcement {
+  final String id;
   final String title;
   final String category;
+  final String scope;
   final String office;
-  final String dates;
-  final String status;
   final String description;
-  final IconData icon;
+  final String attachment;
+  final String createdBy;
+  final String legacyDates;
+  final List<String> tags;
+  final DateTime? start;
+  final DateTime? end;
+  final DateTime? createdAt;
 
   const Announcement({
+    required this.id,
     required this.title,
     required this.category,
+    required this.scope,
     required this.office,
-    required this.dates,
-    required this.status,
     required this.description,
-    this.icon = Icons.campaign_outlined,
+    required this.attachment,
+    required this.createdBy,
+    required this.legacyDates,
+    this.tags = const [],
+    this.start,
+    this.end,
+    this.createdAt,
   });
+
+  factory Announcement.fromDoc(
+      QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data();
+    DateTime? ts(dynamic v) => v is Timestamp ? v.toDate() : null;
+
+    String legacy = '${data['dates'] ?? ''}';
+    if (legacy.isEmpty && data['date_range'] is Timestamp) {
+      legacy = fmtDate((data['date_range'] as Timestamp).toDate());
+    }
+
+    final rawTags = data['tags'];
+
+    return Announcement(
+      id: doc.id,
+      title: '${data['title'] ?? ''}',
+      category: '${data['category'] ?? ''}',
+      scope: '${data['scope'] ?? 'University'}',
+      office: '${data['issuing_office'] ?? ''}',
+      description: '${data['description'] ?? ''}',
+      attachment: '${data['attachment_link'] ?? ''}',
+      createdBy: '${data['createdBy'] ?? ''}',
+      legacyDates: legacy,
+      tags: rawTags is List ? rawTags.map((e) => '$e').toList() : <String>[],
+      start: ts(data['start_date']),
+      end: ts(data['end_date']),
+      createdAt: ts(data['createdAt']),
+    );
+  }
+
+  bool get isExpired => hasEnded(start, end);
+
+  bool get isScheduled => startsLater(start);
+
+  bool get active => !isExpired;
+
+  String get status => isExpired ? 'EXPIRED' : 'ACTIVE';
+
+  String get dates {
+    final s = start;
+    final e = end;
+    if (s != null && e != null) {
+      final sameDay = s.year == e.year && s.month == e.month && s.day == e.day;
+      if (sameDay) return fmtDate(s);
+      return '${fmtDate(s)} – ${fmtDate(e)}';
+    }
+    if (s != null) return fmtDate(s);
+    if (e != null) return 'Until ${fmtDate(e)}';
+    if (legacyDates.isNotEmpty) return legacyDates;
+    final c = createdAt;
+    if (c != null) return 'Posted ${fmtDate(c)}';
+    return 'No date set';
+  }
 }
 
-const sampleAnnouncements = <Announcement>[
-  Announcement(
-    title: 'Class Suspension – Severe Typhoon Warning Advisory',
-    category: 'Class Suspension',
-    office: 'TUP Admin',
-    dates: 'Aug 21 – Aug 23, 2026',
-    status: 'ACTIVE',
-    icon: Icons.thunderstorm_outlined,
-    description:
-        'Due to the escalating warning signals associated with Typhoon Advisory No. 4, classes in all levels, both in-person and online, are suspended from August 21 to August 23, 2026, across all Technological University of the Philippines (TUP) campuses.\n\nStudents and staff are highly advised to remain indoors, prioritize personal safety, and monitor official news channels and state weather advisory guidelines for timely developments. Re-entry guidelines and make-up schedules will be released by the university.',
-  ),
-  Announcement(
-    title: 'First Semester Enrollment Period Extended to End of Month',
-    category: 'Academic Requirements',
-    office: 'Registrar',
-    dates: 'Aug 10 – Aug 31, 2026',
-    status: 'ACTIVE',
-    icon: Icons.school_outlined,
-    description:
-        'The first semester enrollment period has been extended. Students should check the registrar’s official announcements and prepare the required enrollment documents before the new deadline.',
-  ),
-  Announcement(
-    title: 'ID Validation Announcement',
-    category: 'Academic Requirements',
-    office: 'Student Affairs',
-    dates: 'Aug 10 – Aug 12, 2026',
-    status: 'EXPIRED',
-    icon: Icons.badge_outlined,
-    description:
-        'Students who need to validate their university identification cards should follow the schedule and instructions issued by the Student Affairs Office.',
-  ),
-  Announcement(
-    title: 'University General Assembly 2026',
-    category: 'Campus Events',
-    office: 'University Secretariat',
-    dates: 'Sep 05, 2026',
-    status: 'ACTIVE',
-    icon: Icons.groups_outlined,
-    description:
-        'The university community is invited to attend the General Assembly. Please check official campus channels for venue and program updates.',
-  ),
-];
+class OfficerSession {
+  final User? user;
+  final bool ready;
+  final bool approved;
+  final bool approvalKnown;
+  final String role;
+
+  const OfficerSession({
+    this.user,
+    this.ready = false,
+    this.approved = false,
+    this.approvalKnown = false,
+    this.role = '',
+  });
+
+  bool canManage(Announcement a) {
+    final u = user;
+    return u != null && approved && a.createdBy == u.uid;
+  }
+}
+
+Future<void> openAnnouncementForm(
+    BuildContext context, User user, Announcement? existing) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final msg = await Navigator.of(context).push<String>(MaterialPageRoute(
+    builder: (_) => AnnouncementFormScreen(user: user, existing: existing),
+  ));
+  if (msg != null) {
+    messenger.showSnackBar(SnackBar(content: Text(msg)));
+  }
+}
+
+Future<void> confirmDeleteAnnouncement(
+    BuildContext context, Announcement a) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Delete announcement?'),
+      content: Text('"${a.title}" will be removed for everyone. '
+          'This cannot be undone.'),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel')),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete', style: TextStyle(color: burgundy))),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  try {
+    await FirebaseFirestore.instance
+        .collection('announcements')
+        .doc(a.id)
+        .delete();
+    messenger
+        .showSnackBar(const SnackBar(content: Text('Announcement deleted.')));
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('Could not delete: $e')));
+  }
+}
+
+Widget announcementCardFor(
+  BuildContext context,
+  Announcement a,
+  OfficerSession session,
+  ValueChanged<Announcement> onOpen,
+) {
+  final user = session.user;
+  final manage = user != null && session.canManage(a);
+  return AnnouncementCard(
+    announcement: a,
+    onTap: () => onOpen(a),
+    onEdit: manage ? () => openAnnouncementForm(context, user!, a) : null,
+    onDelete: manage ? () => confirmDeleteAnnouncement(context, a) : null,
+  );
+}
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -121,7 +310,81 @@ class MainShell extends StatefulWidget {
 
 class _MainShellState extends State<MainShell> {
   int _tab = 0;
-  final List<Announcement> _announcements = List.of(sampleAnnouncements);
+  OfficerSession _session = const OfficerSession();
+  bool _freshLogin = false;
+  StreamSubscription<User?>? _authSub;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _officerSub;
+
+  late final Stream<QuerySnapshot<Map<String, dynamic>>> _stream =
+      FirebaseFirestore.instance
+          .collection('announcements')
+          .orderBy('createdAt', descending: true)
+          .snapshots(includeMetadataChanges: true);
+
+  @override
+  void initState() {
+    super.initState();
+    _authSub = FirebaseAuth.instance.authStateChanges().listen(_onAuth);
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    _officerSub?.cancel();
+    super.dispose();
+  }
+
+  void _onAuth(User? user) {
+    if (!mounted) return;
+    _officerSub?.cancel();
+    _officerSub = null;
+
+    if (user == null) {
+      _freshLogin = false;
+      setState(() => _session = const OfficerSession(ready: true));
+      return;
+    }
+
+    if (_session.ready && _session.user == null) _freshLogin = true;
+
+    if (!kRequireApproval) {
+      setState(() => _session = OfficerSession(
+          user: user, ready: true, approved: true, approvalKnown: true));
+      _finishLogin();
+      return;
+    }
+
+    setState(() => _session = OfficerSession(user: user, ready: true));
+
+    _officerSub = FirebaseFirestore.instance
+        .collection('officers')
+        .doc(user.uid)
+        .snapshots()
+        .listen((snap) {
+      if (!mounted) return;
+      final approved = snap.data()?['approved'] == true;
+      final role = '${snap.data()?['role'] ?? ''}';
+      setState(() => _session = OfficerSession(
+          user: user,
+          ready: true,
+          approved: approved,
+          approvalKnown: true,
+          role: role));
+      if (approved) _finishLogin();
+    }, onError: (_) {
+      if (!mounted) return;
+      setState(() => _session = OfficerSession(
+          user: user, ready: true, approved: false, approvalKnown: true));
+    });
+  }
+
+  void _finishLogin() {
+    if (!_freshLogin || !mounted) return;
+    _freshLogin = false;
+    final email = _session.user?.email ?? 'your account';
+    setState(() => _tab = 0);
+    showMsg(context, 'Logged in as $email');
+  }
 
   void _openDetails(Announcement announcement) {
     Navigator.of(context).push(MaterialPageRoute(
@@ -131,44 +394,311 @@ class _MainShellState extends State<MainShell> {
 
   @override
   Widget build(BuildContext context) {
-    final pages = [
-      HomeScreen(
-        announcements: _announcements,
-        onOpen: _openDetails,
-        onOpenNotifications: () => Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const NotificationPreferencesScreen()),
-        ),
-      ),
-      EventsScreen(onOpen: _openDetails),
-      const HandbookScreen(),
-      OfficerScreen(
-        onPublished: (announcement) {
-          setState(() {
-            _announcements.insert(0, announcement);
-            _tab = 0;
-          });
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Sample announcement added to the home feed.')),
-          );
-        },
-      ),
-    ];
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: _stream,
+      builder: (context, snap) {
+        final loading = !snap.hasData && !snap.hasError;
+        final error = snap.hasError ? '${snap.error}' : null;
+        final offline = snap.hasData && snap.data!.metadata.isFromCache;
+        final all = snap.hasData
+            ? snap.data!.docs.map(Announcement.fromDoc).toList()
+            : <Announcement>[];
+        final session = _session;
 
-    return Scaffold(
-      body: SafeArea(child: IndexedStack(index: _tab, children: pages)),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (value) => setState(() => _tab = value),
+        final pages = [
+          HomeScreen(
+            announcements: all,
+            loading: loading,
+            error: error,
+            offline: offline,
+            session: session,
+            onOpen: _openDetails,
+            onOpenNotifications: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => const NotificationPreferencesScreen()),
+            ),
+          ),
+          EventsScreen(
+            announcements: all,
+            loading: loading,
+            error: error,
+            session: session,
+            onOpen: _openDetails,
+          ),
+          const HandbookScreen(),
+          OfficerScreen(session: session),
+        ];
+
+        return Scaffold(
+          body: SafeArea(child: IndexedStack(index: _tab, children: pages)),
+          bottomNavigationBar: NavigationBar(
+            selectedIndex: _tab,
+            onDestinationSelected: (value) => setState(() => _tab = value),
+            backgroundColor: Colors.white,
+            indicatorColor: paleRose,
+            height: 68,
+            destinations: [
+              const NavigationDestination(
+                  icon: Icon(Icons.home_outlined),
+                  selectedIcon: Icon(Icons.home),
+                  label: 'Home'),
+              const NavigationDestination(
+                  icon: Icon(Icons.event_outlined),
+                  selectedIcon: Icon(Icons.event),
+                  label: 'Events'),
+              const NavigationDestination(
+                  icon: Icon(Icons.menu_book_outlined),
+                  selectedIcon: Icon(Icons.menu_book),
+                  label: 'Handbook'),
+              NavigationDestination(
+                  icon: const Icon(Icons.admin_panel_settings_outlined),
+                  selectedIcon: const Icon(Icons.admin_panel_settings),
+                  label: session.user != null ? 'Account' : 'Officer Login'),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+Widget scopeChips(String selected, ValueChanged<String> onSelected) {
+  return Wrap(
+    spacing: 8,
+    runSpacing: 4,
+    children: ['All', ...kScopes].map((label) {
+      final isSelected = selected == label;
+      return ChoiceChip(
+        label: Text(label),
+        selected: isSelected,
+        showCheckmark: false,
+        onSelected: (_) => onSelected(label),
+        selectedColor: burgundy,
         backgroundColor: Colors.white,
-        indicatorColor: paleRose,
-        height: 68,
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: 'Home'),
-          NavigationDestination(icon: Icon(Icons.event_outlined), selectedIcon: Icon(Icons.event), label: 'Events'),
-          NavigationDestination(icon: Icon(Icons.menu_book_outlined), selectedIcon: Icon(Icons.menu_book), label: 'Handbook'),
-          NavigationDestination(icon: Icon(Icons.admin_panel_settings_outlined), selectedIcon: Icon(Icons.admin_panel_settings), label: 'Officer Login'),
-        ],
+        side: BorderSide(color: isSelected ? burgundy : line),
+        labelStyle: TextStyle(
+            color: isSelected ? Colors.white : ink,
+            fontSize: 12,
+            fontWeight: FontWeight.w600),
+      );
+    }).toList(),
+  );
+}
+
+class StatusBadge extends StatelessWidget {
+  final bool active;
+  final bool scheduled;
+  const StatusBadge({super.key, required this.active, this.scheduled = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final label = scheduled ? 'SCHEDULED' : (active ? 'ACTIVE' : 'EXPIRED');
+    final bg = scheduled
+        ? const Color(0xFFFFF3E0)
+        : (active ? const Color(0xFFE8F5EC) : const Color(0xFFF0EFF0));
+    final fg = scheduled
+        ? const Color(0xFFB56B18)
+        : (active ? const Color(0xFF27834A) : muted);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration:
+          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(20)),
+      child: Text(label,
+          style: TextStyle(
+              fontSize: 9, fontWeight: FontWeight.w800, color: fg)),
+    );
+  }
+}
+
+class TagWrap extends StatelessWidget {
+  final List<String> tags;
+  const TagWrap({super.key, required this.tags});
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 6,
+      runSpacing: 4,
+      children: tags
+          .map((t) => Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                    color: paleRose, borderRadius: BorderRadius.circular(10)),
+                child: Text('#$t',
+                    style: const TextStyle(
+                        fontSize: 10,
+                        color: burgundy,
+                        fontWeight: FontWeight.w600)),
+              ))
+          .toList(),
+    );
+  }
+}
+
+class OfflineBanner extends StatelessWidget {
+  const OfflineBanner({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+          color: const Color(0xFFFFF3E0),
+          borderRadius: BorderRadius.circular(12)),
+      child: const Row(children: [
+        Icon(Icons.cloud_off_outlined, size: 16, color: Color(0xFFB56B18)),
+        SizedBox(width: 8),
+        Expanded(
+            child: Text('You are offline. Showing saved announcements.',
+                style: TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFFB56B18),
+                    fontWeight: FontWeight.w700))),
+      ]),
+    );
+  }
+}
+
+class OfficerModeBanner extends StatelessWidget {
+  const OfficerModeBanner({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+          color: paleRose, borderRadius: BorderRadius.circular(12)),
+      child: const Row(children: [
+        Icon(Icons.admin_panel_settings_outlined, size: 16, color: burgundy),
+        SizedBox(width: 8),
+        Expanded(
+            child: Text(
+                'Officer mode: you can edit or delete your own announcements.',
+                style: TextStyle(
+                    fontSize: 11,
+                    color: burgundy,
+                    fontWeight: FontWeight.w700))),
+      ]),
+    );
+  }
+}
+
+class AnnouncementCard extends StatelessWidget {
+  final Announcement announcement;
+  final VoidCallback onTap;
+  final VoidCallback? onEdit;
+  final VoidCallback? onDelete;
+  const AnnouncementCard({
+    super.key,
+    required this.announcement,
+    required this.onTap,
+    this.onEdit,
+    this.onDelete,
+  });
+
+  Widget _cardAction(IconData icon, String label, VoidCallback onPressed) {
+    return TextButton.icon(
+      onPressed: onPressed,
+      icon: Icon(icon, size: 15),
+      label: Text(label),
+      style: TextButton.styleFrom(
+        foregroundColor: burgundy,
+        backgroundColor: paleRose,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        minimumSize: const Size(0, 30),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final a = announcement;
+    final color = categoryColor(a.category);
+    final edit = onEdit;
+    final del = onDelete;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      elevation: 0,
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: line)),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(15),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Container(
+                  width: 8,
+                  height: 8,
+                  decoration:
+                      BoxDecoration(color: color, shape: BoxShape.circle)),
+              const SizedBox(width: 7),
+              Expanded(
+                  child: Text(a.category.isEmpty ? 'General' : a.category,
+                      style: TextStyle(
+                          fontSize: 11,
+                          color: color,
+                          fontWeight: FontWeight.w700))),
+              StatusBadge(active: a.active, scheduled: a.isScheduled),
+            ]),
+            const SizedBox(height: 10),
+            Text(a.title,
+                style: const TextStyle(
+                    fontSize: 14,
+                    height: 1.3,
+                    fontWeight: FontWeight.w800,
+                    color: ink)),
+            const SizedBox(height: 8),
+            Row(children: [
+              const Icon(Icons.calendar_today_outlined,
+                  size: 12, color: muted),
+              const SizedBox(width: 5),
+              Expanded(
+                  child: Text('Effective: ${a.dates}',
+                      style: const TextStyle(fontSize: 10, color: muted))),
+            ]),
+            const SizedBox(height: 4),
+            Row(children: [
+              const Icon(Icons.account_balance_outlined,
+                  size: 12, color: muted),
+              const SizedBox(width: 5),
+              Expanded(
+                  child: Text(a.office,
+                      style: const TextStyle(fontSize: 10, color: muted))),
+            ]),
+            if (a.tags.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              TagWrap(tags: a.tags),
+            ],
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                child: (edit == null && del == null)
+                    ? const SizedBox.shrink()
+                    : Wrap(spacing: 6, children: [
+                        if (edit != null) _cardAction(Icons.edit_outlined, 'Edit', edit),
+                        if (del != null) _cardAction(Icons.delete_outline, 'Delete', del),
+                      ]),
+              ),
+              const Text('Tap to expand',
+                  style: TextStyle(
+                      fontSize: 10,
+                      color: burgundy,
+                      fontWeight: FontWeight.w700)),
+              const SizedBox(width: 4),
+              const Icon(Icons.arrow_forward, size: 13, color: burgundy),
+            ]),
+          ]),
+        ),
       ),
     );
   }
@@ -176,12 +706,20 @@ class _MainShellState extends State<MainShell> {
 
 class HomeScreen extends StatefulWidget {
   final List<Announcement> announcements;
+  final bool loading;
+  final String? error;
+  final bool offline;
+  final OfficerSession session;
   final ValueChanged<Announcement> onOpen;
   final VoidCallback onOpenNotifications;
 
   const HomeScreen({
     super.key,
     required this.announcements,
+    required this.loading,
+    required this.error,
+    this.offline = false,
+    required this.session,
     required this.onOpen,
     required this.onOpenNotifications,
   });
@@ -192,8 +730,10 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final _search = TextEditingController();
-  String _scope = 'University';
-  String _category = 'All';
+  String _filter = 'All';
+  String? _value;
+
+  static const _menuFilters = ['Category', 'Issuing Office', 'Status'];
 
   @override
   void dispose() {
@@ -201,15 +741,95 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
+  List<String> _optionsFor(String filter) {
+    switch (filter) {
+      case 'Category':
+        return kCategories;
+      case 'Issuing Office':
+        final extra = widget.announcements
+            .map((a) => a.office)
+            .where((o) => o.isNotEmpty && !kOffices.contains(o))
+            .toSet()
+            .toList();
+        return [...kOffices, ...extra];
+      case 'Status':
+        return const ['Active', 'Expired'];
+      default:
+        return const [];
+    }
+  }
+
+  Widget _pill(String label, bool selected, {bool arrow = false}) {
+    final fg = selected ? Colors.white : ink;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: selected ? burgundy : Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: selected ? burgundy : line),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Text(label,
+            style: TextStyle(
+                color: fg, fontSize: 12, fontWeight: FontWeight.w600)),
+        if (arrow) Icon(Icons.arrow_drop_down, size: 18, color: fg),
+      ]),
+    );
+  }
+
+  Widget _filterButtons() {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        GestureDetector(
+          onTap: () => setState(() {
+            _filter = 'All';
+            _value = null;
+          }),
+          child: _pill('All', _filter == 'All'),
+        ),
+        ..._menuFilters.map((label) {
+          return PopupMenuButton<String>(
+            color: Colors.white,
+            tooltip: '',
+            onSelected: (v) => setState(() {
+              _filter = label;
+              _value = v;
+            }),
+            itemBuilder: (_) => _optionsFor(label)
+                .map((o) => PopupMenuItem<String>(value: o, child: Text(o)))
+                .toList(),
+            child: _pill(label, _filter == label, arrow: true),
+          );
+        }),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final filtered = widget.announcements.where((item) {
-      final q = _search.text.toLowerCase();
-      final matchesSearch = item.title.toLowerCase().contains(q) ||
-          item.category.toLowerCase().contains(q) ||
-          item.office.toLowerCase().contains(q);
-      final matchesCategory = _category == 'All' || item.category == _category;
-      return matchesSearch && matchesCategory;
+    final q = _search.text.trim().toLowerCase();
+    final session = widget.session;
+
+    final filtered = widget.announcements.where((a) {
+      if (a.isScheduled && !session.canManage(a)) return false;
+      final v = _value;
+      if (v != null) {
+        if (_filter == 'Category' && a.category != v) return false;
+        if (_filter == 'Issuing Office' && a.office != v) return false;
+        if (_filter == 'Status') {
+          if (v == 'Active' && !a.active) return false;
+          if (v == 'Expired' && a.active) return false;
+        }
+      }
+      if (q.isEmpty) return true;
+      return a.title.toLowerCase().contains(q) ||
+          a.category.toLowerCase().contains(q) ||
+          a.office.toLowerCase().contains(q) ||
+          a.description.toLowerCase().contains(q) ||
+          a.tags.any((t) => t.toLowerCase().contains(q)) ||
+          a.dates.toLowerCase().contains(q);
     }).toList();
 
     return ListView(
@@ -217,141 +837,80 @@ class _HomeScreenState extends State<HomeScreen> {
       children: [
         Row(
           children: [
-            Expanded(
+            const Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const Text('TUP Campus Updates', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: ink)),
-                const SizedBox(height: 3),
-                Text('Technological University of the Philippines', style: TextStyle(fontSize: 11, color: muted)),
+                Text('TUP Campus Updates',
+                    style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w800,
+                        color: ink)),
+                SizedBox(height: 3),
+                Text('Technological University of the Philippines',
+                    style: TextStyle(fontSize: 11, color: muted)),
               ]),
             ),
             IconButton(
               tooltip: 'Notification preferences',
               onPressed: widget.onOpenNotifications,
-              icon: const Icon(Icons.notifications_none_rounded, color: burgundy),
+              icon: const Icon(Icons.notifications_none_rounded,
+                  color: burgundy),
             ),
           ],
         ),
         const SizedBox(height: 18),
+        if (widget.offline) ...[
+          const OfflineBanner(),
+          const SizedBox(height: 14),
+        ],
+        if (session.user != null && session.approved) ...[
+          const OfficerModeBanner(),
+          const SizedBox(height: 14),
+        ],
         TextField(
           controller: _search,
           onChanged: (_) => setState(() {}),
           decoration: const InputDecoration(
-            hintText: 'Search announcements...',
+            hintText: 'Search by keyword or date...',
             prefixIcon: Icon(Icons.search),
-            suffixIcon: Icon(Icons.tune, size: 19),
           ),
         ),
         const SizedBox(height: 14),
-        Row(
-          children: ['University', 'College', 'Clubs'].map((label) {
-            final selected = _scope == label;
-            return Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: ChoiceChip(
-                label: Text(label),
-                selected: selected,
-                showCheckmark: false,
-                onSelected: (_) => setState(() => _scope = label),
-                selectedColor: burgundy,
-                backgroundColor: Colors.white,
-                side: BorderSide(color: selected ? burgundy : line),
-                labelStyle: TextStyle(color: selected ? Colors.white : ink, fontSize: 12, fontWeight: FontWeight.w600),
-              ),
-            );
-          }).toList(),
-        ),
-        const SizedBox(height: 12),
-        DropdownButtonFormField<String>(
-          value: _category,
-          decoration: const InputDecoration(
-            labelText: 'Filter category',
-            prefixIcon: Icon(Icons.filter_list),
-          ),
-          items: const [
-            DropdownMenuItem(value: 'All', child: Text('All categories')),
-            DropdownMenuItem(value: 'Class Suspension', child: Text('Class Suspensions')),
-            DropdownMenuItem(value: 'Academic Requirements', child: Text('Academic Requirements')),
-            DropdownMenuItem(value: 'Campus Events', child: Text('Campus Events')),
-            DropdownMenuItem(value: 'Organization Updates', child: Text('Organization Updates')),
-            DropdownMenuItem(value: 'Emergency Alerts', child: Text('Emergency Alerts')),
-          ],
-          onChanged: (value) => setState(() => _category = value ?? 'All'),
-        ),
+        _filterButtons(),
         const SizedBox(height: 20),
         Row(
           children: [
-            const Expanded(child: Text('Latest announcements', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800, color: ink))),
-            Text('${filtered.length} posts', style: const TextStyle(color: muted, fontSize: 11)),
+            const Expanded(
+                child: Text('Latest announcements',
+                    style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        color: ink))),
+            Text('${filtered.length} posts',
+                style: const TextStyle(color: muted, fontSize: 11)),
           ],
         ),
         const SizedBox(height: 10),
-        if (filtered.isEmpty)
+        if (widget.error != null)
+          Padding(
+              padding: const EdgeInsets.all(20),
+              child: Text('Could not load announcements: ${widget.error}'))
+        else if (widget.loading)
+          const Padding(
+              padding: EdgeInsets.all(28),
+              child: Center(child: CircularProgressIndicator()))
+        else if (filtered.isEmpty)
           const Padding(
             padding: EdgeInsets.all(28),
-            child: Column(children: [Icon(Icons.search_off, size: 36, color: muted), SizedBox(height: 8), Text('No announcements found.')]),
+            child: Column(children: [
+              Icon(Icons.search_off, size: 36, color: muted),
+              SizedBox(height: 8),
+              Text('No announcements found.')
+            ]),
           )
         else
-          ...filtered.map((item) => AnnouncementCard(announcement: item, onTap: () => widget.onOpen(item))),
+          ...filtered.map((item) =>
+              announcementCardFor(context, item, session, widget.onOpen)),
       ],
-    );
-  }
-}
-
-class AnnouncementCard extends StatelessWidget {
-  final Announcement announcement;
-  final VoidCallback onTap;
-  const AnnouncementCard({super.key, required this.announcement, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    final active = announcement.status == 'ACTIVE';
-    final categoryColor = announcement.category == 'Academic Requirements'
-        ? burgundy
-        : announcement.category == 'Class Suspension'
-            ? const Color(0xFF7750A3)
-            : const Color(0xFFB56B18);
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 12),
-      elevation: 0,
-      color: Colors.white,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: const BorderSide(color: line)),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(16),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.all(15),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [
-              Container(width: 8, height: 8, decoration: BoxDecoration(color: categoryColor, shape: BoxShape.circle)),
-              const SizedBox(width: 7),
-              Expanded(child: Text(announcement.category, style: TextStyle(fontSize: 11, color: categoryColor, fontWeight: FontWeight.w700))),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                decoration: BoxDecoration(color: active ? const Color(0xFFE8F5EC) : const Color(0xFFF0EFF0), borderRadius: BorderRadius.circular(20)),
-                child: Text(announcement.status, style: TextStyle(fontSize: 9, fontWeight: FontWeight.w800, color: active ? const Color(0xFF27834A) : muted)),
-              ),
-            ]),
-            const SizedBox(height: 10),
-            Text(announcement.title, style: const TextStyle(fontSize: 14, height: 1.3, fontWeight: FontWeight.w800, color: ink)),
-            const SizedBox(height: 8),
-            Row(children: [
-              const Icon(Icons.calendar_today_outlined, size: 12, color: muted),
-              const SizedBox(width: 5),
-              Expanded(child: Text('Effective: ${announcement.dates}', style: const TextStyle(fontSize: 10, color: muted))),
-            ]),
-            const SizedBox(height: 10),
-            const Align(
-              alignment: Alignment.centerRight,
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Text('Tap to expand', style: TextStyle(fontSize: 10, color: burgundy, fontWeight: FontWeight.w700)),
-                SizedBox(width: 4),
-                Icon(Icons.arrow_forward, size: 13, color: burgundy),
-              ]),
-            ),
-          ]),
-        ),
-      ),
     );
   }
 }
@@ -360,64 +919,142 @@ class AnnouncementDetailScreen extends StatelessWidget {
   final Announcement announcement;
   const AnnouncementDetailScreen({super.key, required this.announcement});
 
+  Future<void> _share(BuildContext context) async {
+    final a = announcement;
+    final text =
+        '${a.title}\n${a.dates}\nPosted by ${a.office}\n\n${a.description}';
+    await Clipboard.setData(ClipboardData(text: text));
+    if (context.mounted) {
+      showMsg(context, 'Announcement copied. Paste it anywhere to share.');
+    }
+  }
+
+  Future<void> _saveToCalendar(BuildContext context) async {
+    final a = announcement;
+    final s = a.start ?? a.end;
+    if (s == null) {
+      showMsg(context, 'This announcement has no date to save.');
+      return;
+    }
+    final e = a.end ?? s;
+    final endExclusive = DateTime(e.year, e.month, e.day).add(const Duration(days: 1));
+    final uri = Uri.https('calendar.google.com', '/calendar/render', {
+      'action': 'TEMPLATE',
+      'text': a.title,
+      'dates': '${_ymd(s)}/${_ymd(endExclusive)}',
+      'details': '${a.description}\n\nPosted by ${a.office}',
+    });
+    await Clipboard.setData(ClipboardData(text: uri.toString()));
+    if (context.mounted) {
+      showMsg(context,
+          'Calendar link copied. Paste it in your browser to add the event.');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final active = announcement.status == 'ACTIVE';
+    final a = announcement;
     return Scaffold(
       appBar: AppBar(
-        leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context)),
-        title: const Text('Advisory Details', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context)),
+        title: const Text('Advisory Details',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
       ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
         children: [
           Row(children: [
-            const CircleAvatar(radius: 15, backgroundColor: paleRose, child: Icon(Icons.account_balance, color: burgundy, size: 16)),
+            const CircleAvatar(
+                radius: 15,
+                backgroundColor: paleRose,
+                child: Icon(Icons.account_balance, color: burgundy, size: 16)),
             const SizedBox(width: 9),
-            Expanded(child: Text('Posted by ${announcement.office}', style: const TextStyle(fontSize: 12, color: muted))),
-            StatusBadge(active: active),
+            Expanded(
+                child: Text('Posted by ${a.office}',
+                    style: const TextStyle(fontSize: 12, color: muted))),
+            StatusBadge(active: a.active, scheduled: a.isScheduled),
           ]),
           const SizedBox(height: 18),
-          Text(announcement.title, style: const TextStyle(fontSize: 22, height: 1.2, fontWeight: FontWeight.w800, color: ink)),
+          Text(a.title,
+              style: const TextStyle(
+                  fontSize: 22,
+                  height: 1.2,
+                  fontWeight: FontWeight.w800,
+                  color: ink)),
           const SizedBox(height: 12),
           Row(children: [
             const Icon(Icons.calendar_month_outlined, size: 16, color: muted),
             const SizedBox(width: 7),
-            Expanded(child: Text(announcement.dates, style: const TextStyle(fontSize: 12, color: muted))),
+            Expanded(
+                child: Text(a.dates,
+                    style: const TextStyle(fontSize: 12, color: muted))),
           ]),
+          if (a.tags.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            TagWrap(tags: a.tags),
+          ],
           const SizedBox(height: 22),
-          Text(announcement.description, style: const TextStyle(fontSize: 14, height: 1.65, color: Color(0xFF4F4A4E))),
-          const SizedBox(height: 24),
-          const Text('ATTACHMENT', style: TextStyle(fontSize: 11, letterSpacing: 1, fontWeight: FontWeight.w800, color: muted)),
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(color: const Color(0xFFF8F4E9), borderRadius: BorderRadius.circular(14), border: Border.all(color: const Color(0xFFE9DFC9))),
-            child: const Row(children: [
-              Icon(Icons.picture_as_pdf_outlined, color: burgundy, size: 30),
-              SizedBox(width: 12),
-              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('Advisory_Attachment.pdf', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12)),
-                SizedBox(height: 3),
-                Text('Sample document preview', style: TextStyle(fontSize: 10, color: muted)),
-              ])),
-              Icon(Icons.visibility_outlined, color: burgundy),
-            ]),
-          ),
+          Text(a.description,
+              style: const TextStyle(
+                  fontSize: 14, height: 1.65, color: Color(0xFF4F4A4E))),
+          if (a.attachment.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            const Text('ATTACHMENT',
+                style: TextStyle(
+                    fontSize: 11,
+                    letterSpacing: 1,
+                    fontWeight: FontWeight.w800,
+                    color: muted)),
+            const SizedBox(height: 10),
+            InkWell(
+              borderRadius: BorderRadius.circular(14),
+              onTap: () async {
+                await Clipboard.setData(ClipboardData(text: a.attachment));
+                if (context.mounted) showMsg(context, 'Link copied.');
+              },
+              child: Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                    color: const Color(0xFFF8F4E9),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFFE9DFC9))),
+                child: Row(children: [
+                  const Icon(Icons.link, color: burgundy, size: 26),
+                  const SizedBox(width: 12),
+                  Expanded(
+                      child: Text(a.attachment,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.w700, fontSize: 12))),
+                  const Icon(Icons.copy_outlined, color: burgundy, size: 20),
+                ]),
+              ),
+            ),
+          ],
           const SizedBox(height: 22),
           Row(children: [
-            Expanded(child: FilledButton.icon(
-              onPressed: () => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Calendar action is a UI demo.'))),
+            Expanded(
+                child: FilledButton.icon(
+              onPressed: () => _saveToCalendar(context),
               icon: const Icon(Icons.calendar_month, size: 17),
               label: const Text('Save to Calendar'),
-              style: FilledButton.styleFrom(backgroundColor: burgundy, padding: const EdgeInsets.symmetric(vertical: 13)),
+              style: FilledButton.styleFrom(
+                  backgroundColor: burgundy,
+                  padding: const EdgeInsets.symmetric(vertical: 13)),
             )),
             const SizedBox(width: 10),
             OutlinedButton.icon(
-              onPressed: () => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Share action is a UI demo.'))),
+              onPressed: () => _share(context),
               icon: const Icon(Icons.share_outlined, size: 17),
               label: const Text('Share'),
-              style: OutlinedButton.styleFrom(foregroundColor: burgundy, side: const BorderSide(color: burgundy), padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 12)),
+              style: OutlinedButton.styleFrom(
+                  foregroundColor: burgundy,
+                  side: const BorderSide(color: burgundy),
+                  padding: const EdgeInsets.symmetric(
+                      vertical: 13, horizontal: 12)),
             ),
           ]),
         ],
@@ -426,67 +1063,93 @@ class AnnouncementDetailScreen extends StatelessWidget {
   }
 }
 
-class StatusBadge extends StatelessWidget {
-  final bool active;
-  const StatusBadge({super.key, required this.active});
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
-    decoration: BoxDecoration(color: active ? const Color(0xFFE8F5EC) : const Color(0xFFF0EFF0), borderRadius: BorderRadius.circular(20)),
-    child: Text(active ? 'ACTIVE' : 'EXPIRED', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w800, color: active ? const Color(0xFF27834A) : muted)),
-  );
-}
-
 class EventsScreen extends StatefulWidget {
+  final List<Announcement> announcements;
+  final bool loading;
+  final String? error;
+  final OfficerSession session;
   final ValueChanged<Announcement> onOpen;
-  const EventsScreen({super.key, required this.onOpen});
+  const EventsScreen({
+    super.key,
+    required this.announcements,
+    required this.loading,
+    required this.error,
+    required this.session,
+    required this.onOpen,
+  });
 
   @override
   State<EventsScreen> createState() => _EventsScreenState();
 }
 
 class _EventsScreenState extends State<EventsScreen> {
-  String _scope = 'University';
+  String _scope = 'All';
+
   @override
   Widget build(BuildContext context) {
-    final events = sampleAnnouncements.where((a) => a.category == 'Campus Events' || a.category == 'Class Suspension').toList();
+    final session = widget.session;
+    final events = widget.announcements.where((a) {
+      final isEvent =
+          a.category == 'Campus Events' || a.category == 'Organization Updates';
+      if (!isEvent) return false;
+      if (a.isScheduled && !session.canManage(a)) return false;
+      if (_scope != 'All' && a.scope != _scope) return false;
+      return true;
+    }).toList();
+
     return ListView(padding: const EdgeInsets.all(20), children: [
-      const Text('Campus Events', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: ink)),
+      const Text('Campus Events',
+          style:
+              TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: ink)),
       const SizedBox(height: 4),
-      const Text('Discover what is happening around TUP.', style: TextStyle(color: muted, fontSize: 12)),
+      const Text('Discover what is happening around TUP.',
+          style: TextStyle(color: muted, fontSize: 12)),
       const SizedBox(height: 18),
-      Row(children: ['University', 'College', 'Clubs'].map((s) => Padding(
-        padding: const EdgeInsets.only(right: 8),
-        child: ChoiceChip(label: Text(s), selected: _scope == s, showCheckmark: false, selectedColor: burgundy,
-          labelStyle: TextStyle(color: _scope == s ? Colors.white : ink),
-          onSelected: (_) => setState(() => _scope = s)),
-      )).toList()),
+      scopeChips(_scope, (v) => setState(() => _scope = v)),
       const SizedBox(height: 14),
       Container(
         padding: const EdgeInsets.all(18),
-        decoration: BoxDecoration(color: burgundy, borderRadius: BorderRadius.circular(18)),
-        child: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Icon(Icons.event_available, color: Colors.white, size: 30),
-          SizedBox(height: 14),
-          Text('Stay connected with campus life', style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w800)),
-          SizedBox(height: 5),
-          Text('University-wide, college-specific, and student organization events.', style: TextStyle(color: Colors.white70, fontSize: 12, height: 1.4)),
-        ]),
+        decoration: BoxDecoration(
+            color: burgundy, borderRadius: BorderRadius.circular(18)),
+        child: const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.event_available, color: Colors.white, size: 30),
+              SizedBox(height: 14),
+              Text('Stay connected with campus life',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w800)),
+              SizedBox(height: 5),
+              Text(
+                  'University-wide, college-specific, and student organization events.',
+                  style: TextStyle(
+                      color: Colors.white70, fontSize: 12, height: 1.4)),
+            ]),
       ),
       const SizedBox(height: 20),
-      const Text('Upcoming and featured', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+      const Text('Upcoming and featured',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
       const SizedBox(height: 10),
-      ...events.map((e) => AnnouncementCard(announcement: e, onTap: () => widget.onOpen(e))),
-      Card(
-        elevation: 0, color: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: const BorderSide(color: line)),
-        child: const ListTile(
-          leading: CircleAvatar(backgroundColor: paleRose, child: Icon(Icons.groups_outlined, color: burgundy)),
-          title: Text('TUP Student Research Symposium', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
-          subtitle: Text('University-wide • Sample event', style: TextStyle(fontSize: 11)),
-          trailing: Icon(Icons.chevron_right, color: burgundy),
-        ),
-      ),
+      if (widget.error != null)
+        Text('Could not load events: ${widget.error}')
+      else if (widget.loading)
+        const Padding(
+            padding: EdgeInsets.all(24),
+            child: Center(child: CircularProgressIndicator()))
+      else if (events.isEmpty)
+        const Padding(
+          padding: EdgeInsets.all(24),
+          child: Column(children: [
+            Icon(Icons.event_busy, size: 36, color: muted),
+            SizedBox(height: 8),
+            Text('No events posted yet.')
+          ]),
+        )
+      else
+        ...events.map(
+            (e) => announcementCardFor(context, e, session, widget.onOpen)),
     ]);
   }
 }
@@ -501,12 +1164,18 @@ class HandbookScreen extends StatefulWidget {
 class _HandbookScreenState extends State<HandbookScreen> {
   final _search = TextEditingController();
   final _topics = const [
-    ('Academic Policies', 'University rules and academic regulations', Icons.school_outlined),
-    ('Code of Conduct', 'Student responsibilities and policies', Icons.gavel_outlined),
-    ('Grading System', 'Understand grading and assessment', Icons.grade_outlined),
-    ('Student Services', 'Counseling, support, and campus services', Icons.support_agent_outlined),
-    ('Student Calendar', 'Academic calendar and important dates', Icons.calendar_month_outlined),
-    ('Dress Code', 'Uniform and campus attire guidelines', Icons.checkroom_outlined),
+    ('Academic Policies', 'University rules and academic regulations',
+        Icons.school_outlined),
+    ('Code of Conduct', 'Student responsibilities and policies',
+        Icons.gavel_outlined),
+    ('Grading System', 'Understand grading and assessment',
+        Icons.grade_outlined),
+    ('Student Services', 'Counseling, support, and campus services',
+        Icons.support_agent_outlined),
+    ('Student Calendar', 'Academic calendar and important dates',
+        Icons.calendar_month_outlined),
+    ('Dress Code', 'Uniform and campus attire guidelines',
+        Icons.checkroom_outlined),
   ];
 
   @override
@@ -517,39 +1186,69 @@ class _HandbookScreenState extends State<HandbookScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final visible = _topics.where((t) => t.$1.toLowerCase().contains(_search.text.toLowerCase()) || t.$2.toLowerCase().contains(_search.text.toLowerCase())).toList();
+    final q = _search.text.toLowerCase();
+    final visible = _topics
+        .where((t) =>
+            t.$1.toLowerCase().contains(q) || t.$2.toLowerCase().contains(q))
+        .toList();
     return ListView(padding: const EdgeInsets.all(20), children: [
-      const Text('Student Handbook', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: ink)),
+      const Text('Student Handbook',
+          style:
+              TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: ink)),
       const SizedBox(height: 4),
-      const Text('Quick access to frequently referenced campus policies.', style: TextStyle(color: muted, fontSize: 12)),
+      const Text('Quick access to frequently referenced campus policies.',
+          style: TextStyle(color: muted, fontSize: 12)),
       const SizedBox(height: 18),
-      TextField(controller: _search, onChanged: (_) => setState(() {}), decoration: const InputDecoration(hintText: 'Search handbook...', prefixIcon: Icon(Icons.search))),
+      TextField(
+          controller: _search,
+          onChanged: (_) => setState(() {}),
+          decoration: const InputDecoration(
+              hintText: 'Search handbook...', prefixIcon: Icon(Icons.search))),
       const SizedBox(height: 18),
       ...visible.map((topic) => Card(
-        margin: const EdgeInsets.only(bottom: 10),
-        elevation: 0,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: line)),
-        child: ListTile(
-          contentPadding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
-          leading: CircleAvatar(backgroundColor: paleRose, child: Icon(topic.$3, color: burgundy, size: 20)),
-          title: Text(topic.$1, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800)),
-          subtitle: Text(topic.$2, style: const TextStyle(fontSize: 10, color: muted)),
-          trailing: const Icon(Icons.chevron_right, color: burgundy),
-          onTap: () => showModalBottomSheet(
-            context: context,
-            showDragHandle: true,
-            builder: (_) => Padding(
-              padding: const EdgeInsets.fromLTRB(22, 8, 22, 32),
-              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(topic.$1, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
-                const SizedBox(height: 12),
-                Text('${topic.$2}.\n\nThis is placeholder handbook content for the UI prototype. Replace it with verified text from the official TUP student handbook.', style: const TextStyle(height: 1.6, color: muted)),
-              ]),
+            margin: const EdgeInsets.only(bottom: 10),
+            elevation: 0,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+                side: const BorderSide(color: line)),
+            child: ListTile(
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
+              leading: CircleAvatar(
+                  backgroundColor: paleRose,
+                  child: Icon(topic.$3, color: burgundy, size: 20)),
+              title: Text(topic.$1,
+                  style: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w800)),
+              subtitle: Text(topic.$2,
+                  style: const TextStyle(fontSize: 10, color: muted)),
+              trailing: const Icon(Icons.chevron_right, color: burgundy),
+              onTap: () => showModalBottomSheet(
+                context: context,
+                showDragHandle: true,
+                builder: (_) => Padding(
+                  padding: const EdgeInsets.fromLTRB(22, 8, 22, 32),
+                  child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(topic.$1,
+                            style: const TextStyle(
+                                fontSize: 20, fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 12),
+                        Text(
+                            '${topic.$2}.\n\nThis is placeholder handbook content. Replace it with verified text from the official TUP student handbook.',
+                            style:
+                                const TextStyle(height: 1.6, color: muted)),
+                      ]),
+                ),
+              ),
             ),
-          ),
-        ),
-      )),
-      if (visible.isEmpty) const Padding(padding: EdgeInsets.all(20), child: Text('No handbook topics found.')),
+          )),
+      if (visible.isEmpty)
+        const Padding(
+            padding: EdgeInsets.all(20),
+            child: Text('No handbook topics found.')),
     ]);
   }
 }
@@ -558,10 +1257,12 @@ class NotificationPreferencesScreen extends StatefulWidget {
   const NotificationPreferencesScreen({super.key});
 
   @override
-  State<NotificationPreferencesScreen> createState() => _NotificationPreferencesScreenState();
+  State<NotificationPreferencesScreen> createState() =>
+      _NotificationPreferencesScreenState();
 }
 
-class _NotificationPreferencesScreenState extends State<NotificationPreferencesScreen> {
+class _NotificationPreferencesScreenState
+    extends State<NotificationPreferencesScreen> {
   final Map<String, bool> _settings = {
     'Class Suspensions': true,
     'Emergency Alerts': true,
@@ -572,53 +1273,131 @@ class _NotificationPreferencesScreenState extends State<NotificationPreferencesS
   };
 
   @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      for (final key in _settings.keys.toList()) {
+        _settings[key] = prefs.getBool('notif_$key') ?? _settings[key]!;
+      }
+    });
+  }
+
+  Future<void> _save() async {
+    final prefs = await SharedPreferences.getInstance();
+    for (final entry in _settings.entries) {
+      await prefs.setBool('notif_${entry.key}', entry.value);
+    }
+    if (!mounted) return;
+    Navigator.pop(context);
+    showMsg(context, 'Preferences saved.');
+  }
+
+  @override
   Widget build(BuildContext context) {
     final categories = _settings.keys.toList();
     return Scaffold(
-      appBar: AppBar(title: const Text('Notification Preferences', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700))),
+      appBar: AppBar(
+          title: const Text('Notification Preferences',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700))),
       body: ListView(padding: const EdgeInsets.all(20), children: [
-        const Text('FILTER BY CATEGORY', style: TextStyle(fontSize: 10, letterSpacing: 1, color: muted, fontWeight: FontWeight.w800)),
+        const Text('FILTER BY CATEGORY',
+            style: TextStyle(
+                fontSize: 10,
+                letterSpacing: 1,
+                color: muted,
+                fontWeight: FontWeight.w800)),
         const SizedBox(height: 8),
-        ...categories.take(3).map((name) => _preferenceTile(name, 'Urgent campus updates and important notices')),
+        ...categories.take(3).map((name) =>
+            _preferenceTile(name, 'Urgent campus updates and important notices')),
         const SizedBox(height: 20),
-        const Text('FILTER BY CONTRIBUTOR', style: TextStyle(fontSize: 10, letterSpacing: 1, color: muted, fontWeight: FontWeight.w800)),
+        const Text('FILTER BY CONTRIBUTOR',
+            style: TextStyle(
+                fontSize: 10,
+                letterSpacing: 1,
+                color: muted,
+                fontWeight: FontWeight.w800)),
         const SizedBox(height: 8),
-        ...categories.skip(3).map((name) => _preferenceTile(name, 'Updates from this office or organization')),
+        ...categories.skip(3).map((name) =>
+            _preferenceTile(name, 'Updates from this office or organization')),
         const SizedBox(height: 24),
         FilledButton(
-          style: FilledButton.styleFrom(backgroundColor: burgundy, padding: const EdgeInsets.symmetric(vertical: 15)),
-          onPressed: () {
-            Navigator.pop(context);
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Preferences saved for this demo session.')));
-          },
-          child: const Text('Save Preferences', style: TextStyle(fontWeight: FontWeight.w700)),
+          style: FilledButton.styleFrom(
+              backgroundColor: burgundy,
+              padding: const EdgeInsets.symmetric(vertical: 15)),
+          onPressed: _save,
+          child: const Text('Save Preferences',
+              style: TextStyle(fontWeight: FontWeight.w700)),
         ),
       ]),
     );
   }
 
   Widget _preferenceTile(String name, String subtitle) => SwitchListTile(
-    contentPadding: EdgeInsets.zero,
-    title: Text(name, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700)),
-    subtitle: Text(subtitle, style: const TextStyle(fontSize: 10, color: muted)),
-    value: _settings[name]!,
-    activeThumbColor: burgundy,
-    onChanged: (value) => setState(() => _settings[name] = value),
-  );
+        contentPadding: EdgeInsets.zero,
+        title: Text(name,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700)),
+        subtitle: Text(subtitle,
+            style: const TextStyle(fontSize: 10, color: muted)),
+        value: _settings[name]!,
+        activeThumbColor: burgundy,
+        onChanged: (value) => setState(() => _settings[name] = value),
+      );
 }
 
-class OfficerScreen extends StatefulWidget {
-  final ValueChanged<Announcement> onPublished;
-  const OfficerScreen({super.key, required this.onPublished});
+class OfficerScreen extends StatelessWidget {
+  final OfficerSession session;
+  const OfficerScreen({super.key, required this.session});
 
   @override
-  State<OfficerScreen> createState() => _OfficerScreenState();
+  Widget build(BuildContext context) {
+    if (!session.ready) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final user = session.user;
+    if (user == null) return const OfficerLoginView();
+    if (!session.approvalKnown) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (!session.approved) return PendingApprovalView(user: user);
+    return OfficerAccountView(user: user, role: session.role);
+  }
 }
 
-class _OfficerScreenState extends State<OfficerScreen> {
+Future<void> ensureOfficerDoc(User user, {String? role}) async {
+  final ref = FirebaseFirestore.instance.collection('officers').doc(user.uid);
+  final snap = await ref.get();
+  if (!snap.exists) {
+    await ref.set({
+      'email': user.email,
+      'approved': false,
+      'createdAt': Timestamp.now(),
+      if (role != null) 'role': role,
+    }, SetOptions(merge: true));
+  } else if (role != null && '${snap.data()?['role'] ?? ''}'.isEmpty) {
+    try {
+      await ref.update({'role': role});
+    } catch (_) {}
+  }
+}
+
+class OfficerLoginView extends StatefulWidget {
+  const OfficerLoginView({super.key});
+
+  @override
+  State<OfficerLoginView> createState() => _OfficerLoginViewState();
+}
+
+class _OfficerLoginViewState extends State<OfficerLoginView> {
   final _id = TextEditingController();
   final _password = TextEditingController();
-  bool _loggedIn = false;
+  String _role = kRoles.last;
+  bool _busy = false;
 
   @override
   void dispose() {
@@ -627,159 +1406,629 @@ class _OfficerScreenState extends State<OfficerScreen> {
     super.dispose();
   }
 
+  Future<void> _submit({required bool signUp}) async {
+    final email = _id.text.trim();
+    final pass = _password.text;
+    if (email.isEmpty || pass.isEmpty) {
+      showMsg(context, 'Enter your email and password.');
+      return;
+    }
+    if (signUp && pass.length < 6) {
+      showMsg(context, 'Password must be at least 6 characters.');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final cred = signUp
+          ? await FirebaseAuth.instance
+              .createUserWithEmailAndPassword(email: email, password: pass)
+          : await FirebaseAuth.instance
+              .signInWithEmailAndPassword(email: email, password: pass);
+      final user = cred.user;
+      if (user != null) {
+        await ensureOfficerDoc(user, role: signUp ? _role : null);
+      }
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        showMsg(context, '${signUp ? 'Sign up' : 'Login'} failed: ${e.message}');
+      }
+    } catch (e) {
+      if (mounted) showMsg(context, 'Something went wrong: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (_loggedIn) {
-      return PublishAnnouncementScreen(onPublished: (a) {
-        widget.onPublished(a);
-        setState(() => _loggedIn = false);
-      }, onLogout: () => setState(() => _loggedIn = false));
-    }
     return ListView(padding: const EdgeInsets.all(22), children: [
       const SizedBox(height: 22),
-      const Center(child: CircleAvatar(radius: 34, backgroundColor: paleRose, child: Icon(Icons.admin_panel_settings_outlined, size: 36, color: burgundy))),
+      const Center(
+          child: CircleAvatar(
+              radius: 34,
+              backgroundColor: paleRose,
+              child: Icon(Icons.admin_panel_settings_outlined,
+                  size: 36, color: burgundy))),
       const SizedBox(height: 18),
-      const Text('TUP Account Sign-in', textAlign: TextAlign.center, style: TextStyle(fontSize: 23, fontWeight: FontWeight.w800, color: ink)),
+      const Text('TUP Account Sign-in',
+          textAlign: TextAlign.center,
+          style:
+              TextStyle(fontSize: 23, fontWeight: FontWeight.w800, color: ink)),
       const SizedBox(height: 6),
-      const Text('For authorized university officers and contributors', textAlign: TextAlign.center, style: TextStyle(fontSize: 12, color: muted)),
+      const Text('For authorized university officers and contributors',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 12, color: muted)),
       const SizedBox(height: 26),
-      const Text('Officer Login', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+      const Text('Officer Login',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
       const SizedBox(height: 5),
-      const Text('Use your Student/Admin ID to continue.', style: TextStyle(fontSize: 11, color: muted)),
+      const Text('Use your TUP email and password to continue.',
+          style: TextStyle(fontSize: 11, color: muted)),
       const SizedBox(height: 18),
-      TextField(controller: _id, decoration: const InputDecoration(labelText: 'Student / Admin ID', prefixIcon: Icon(Icons.person_outline))),
+      TextField(
+          controller: _id,
+          keyboardType: TextInputType.emailAddress,
+          autofillHints: null,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: const InputDecoration(
+              labelText: 'Email', prefixIcon: Icon(Icons.person_outline))),
       const SizedBox(height: 12),
-      TextField(controller: _password, obscureText: true, decoration: const InputDecoration(labelText: 'Password', prefixIcon: Icon(Icons.lock_outline))),
+      TextField(
+          controller: _password,
+          obscureText: true,
+          autofillHints: null,
+          autocorrect: false,
+          enableSuggestions: false,
+          onSubmitted: (_) {
+            if (!_busy) _submit(signUp: false);
+          },
+          decoration: const InputDecoration(
+              labelText: 'Password', prefixIcon: Icon(Icons.lock_outline))),
+      const SizedBox(height: 12),
+      DropdownButtonFormField<String>(
+        value: _role,
+        decoration: const InputDecoration(
+            labelText: 'Role (used when creating an account)',
+            prefixIcon: Icon(Icons.badge_outlined)),
+        items: kRoles
+            .map((r) => DropdownMenuItem(value: r, child: Text(r)))
+            .toList(),
+        onChanged: (v) => setState(() => _role = v ?? _role),
+      ),
       const SizedBox(height: 20),
       FilledButton(
-        style: FilledButton.styleFrom(backgroundColor: burgundy, padding: const EdgeInsets.symmetric(vertical: 15)),
-        onPressed: () {
-          if (_id.text.trim().isEmpty || _password.text.isEmpty) {
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter a sample ID and password to preview the next screen.')));
-          } else {
-            setState(() => _loggedIn = true);
-          }
-        },
-        child: const Text('Log In', style: TextStyle(fontWeight: FontWeight.w700)),
+        style: FilledButton.styleFrom(
+            backgroundColor: burgundy,
+            padding: const EdgeInsets.symmetric(vertical: 15)),
+        onPressed: _busy ? null : () => _submit(signUp: false),
+        child: _busy
+            ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: Colors.white))
+            : const Text('Log In',
+                style: TextStyle(fontWeight: FontWeight.w700)),
+      ),
+      TextButton(
+        onPressed: _busy ? null : () => _submit(signUp: true),
+        child:
+            const Text('Create account', style: TextStyle(color: burgundy)),
       ),
       const SizedBox(height: 12),
-      const Text('UI prototype only. This form does not authenticate real TUP accounts.', textAlign: TextAlign.center, style: TextStyle(fontSize: 10, color: muted)),
+      Text(
+          kRequireApproval
+              ? 'New accounts must be approved by an administrator before they can publish.'
+              : 'Log in to publish announcements.',
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 10, color: muted)),
     ]);
   }
 }
 
-class PublishAnnouncementScreen extends StatefulWidget {
-  final ValueChanged<Announcement> onPublished;
-  final VoidCallback onLogout;
-  const PublishAnnouncementScreen({super.key, required this.onPublished, required this.onLogout});
+class PendingApprovalView extends StatefulWidget {
+  final User user;
+  const PendingApprovalView({super.key, required this.user});
 
   @override
-  State<PublishAnnouncementScreen> createState() => _PublishAnnouncementScreenState();
+  State<PendingApprovalView> createState() => _PendingApprovalViewState();
 }
 
-class _PublishAnnouncementScreenState extends State<PublishAnnouncementScreen> {
-  final _title = TextEditingController();
-  final _description = TextEditingController();
-  final _office = TextEditingController(text: 'TUP Admin');
-  String _category = 'Class Suspension';
+class _PendingApprovalViewState extends State<PendingApprovalView> {
+  @override
+  void initState() {
+    super.initState();
+    ensureOfficerDoc(widget.user).catchError((_) {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(padding: const EdgeInsets.all(24), children: [
+      const SizedBox(height: 40),
+      const Center(
+          child: CircleAvatar(
+              radius: 34,
+              backgroundColor: paleRose,
+              child: Icon(Icons.hourglass_top, size: 34, color: burgundy))),
+      const SizedBox(height: 18),
+      const Text('Waiting for approval',
+          textAlign: TextAlign.center,
+          style:
+              TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: ink)),
+      const SizedBox(height: 8),
+      Text(
+          '${widget.user.email ?? 'This account'} has not been approved to publish yet. Please ask a TUP administrator to approve it.',
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 12, color: muted, height: 1.5)),
+      const SizedBox(height: 22),
+      OutlinedButton(
+        onPressed: () => FirebaseAuth.instance.signOut(),
+        style: OutlinedButton.styleFrom(
+            foregroundColor: burgundy,
+            side: const BorderSide(color: burgundy),
+            padding: const EdgeInsets.symmetric(vertical: 14)),
+        child: const Text('Log out'),
+      ),
+    ]);
+  }
+}
+
+class OfficerAccountView extends StatelessWidget {
+  final User user;
+  final String role;
+  const OfficerAccountView({super.key, required this.user, this.role = ''});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(padding: const EdgeInsets.all(22), children: [
+      const SizedBox(height: 22),
+      const Center(
+          child: CircleAvatar(
+              radius: 34,
+              backgroundColor: paleRose,
+              child: Icon(Icons.admin_panel_settings_outlined,
+                  size: 36, color: burgundy))),
+      const SizedBox(height: 18),
+      const Text('Officer Account',
+          textAlign: TextAlign.center,
+          style:
+              TextStyle(fontSize: 23, fontWeight: FontWeight.w800, color: ink)),
+      const SizedBox(height: 6),
+      const Text('Manage announcements for the campus community',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 12, color: muted)),
+      const SizedBox(height: 26),
+      Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: line)),
+        child: Row(children: [
+          const CircleAvatar(
+              radius: 20,
+              backgroundColor: paleRose,
+              child: Icon(Icons.person_outline, color: burgundy, size: 22)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('LOGGED IN AS',
+                  style: TextStyle(
+                      fontSize: 10,
+                      letterSpacing: 1,
+                      fontWeight: FontWeight.w800,
+                      color: muted)),
+              const SizedBox(height: 4),
+              Text(user.email ?? 'Unknown account',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 14, fontWeight: FontWeight.w800, color: ink)),
+              const SizedBox(height: 2),
+              Text(role.isEmpty ? 'Role not set' : role,
+                  style: const TextStyle(fontSize: 11, color: muted)),
+            ]),
+          ),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+            decoration: BoxDecoration(
+                color: const Color(0xFFE8F5EC),
+                borderRadius: BorderRadius.circular(20)),
+            child: const Text('APPROVED',
+                style: TextStyle(
+                    fontSize: 9,
+                    fontWeight: FontWeight.w800,
+                    color: Color(0xFF27834A))),
+          ),
+        ]),
+      ),
+      const SizedBox(height: 20),
+      FilledButton.icon(
+        onPressed: () => openAnnouncementForm(context, user, null),
+        icon: const Icon(Icons.add),
+        label: const Text('Publish announcement',
+            style: TextStyle(fontWeight: FontWeight.w800)),
+        style: FilledButton.styleFrom(
+            backgroundColor: burgundy,
+            padding: const EdgeInsets.symmetric(vertical: 15)),
+      ),
+      const SizedBox(height: 12),
+      const Text(
+          'To edit or delete your announcements, go to Home. Your posts have Edit and Delete buttons.',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 11, color: muted, height: 1.5)),
+      const SizedBox(height: 22),
+      OutlinedButton(
+        onPressed: () => FirebaseAuth.instance.signOut(),
+        style: OutlinedButton.styleFrom(
+            foregroundColor: burgundy,
+            side: const BorderSide(color: burgundy),
+            padding: const EdgeInsets.symmetric(vertical: 14)),
+        child: const Text('Log out'),
+      ),
+    ]);
+  }
+}
+
+class AnnouncementFormScreen extends StatefulWidget {
+  final User user;
+  final Announcement? existing;
+  const AnnouncementFormScreen(
+      {super.key, required this.user, this.existing});
+
+  @override
+  State<AnnouncementFormScreen> createState() =>
+      _AnnouncementFormScreenState();
+}
+
+class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
+  late final TextEditingController _title;
+  late final TextEditingController _description;
+  late final TextEditingController _office;
+  late final TextEditingController _attachment;
+  late final TextEditingController _tags;
+  late String _category;
+  late String _scope;
   DateTime? _start;
   DateTime? _end;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.existing;
+    _title = TextEditingController(text: e?.title ?? '');
+    _description = TextEditingController(text: e?.description ?? '');
+    _office = TextEditingController(text: e?.office ?? 'TUP Admin');
+    _attachment = TextEditingController(text: e?.attachment ?? '');
+    _tags = TextEditingController(text: e?.tags.join(', ') ?? '');
+    _category = (e != null && kCategories.contains(e.category))
+        ? e.category
+        : kCategories.first;
+    _scope = (e != null && kScopes.contains(e.scope)) ? e.scope : kScopes.first;
+    _start = e?.start;
+    _end = e?.end;
+  }
 
   @override
   void dispose() {
     _title.dispose();
     _description.dispose();
     _office.dispose();
+    _attachment.dispose();
+    _tags.dispose();
     super.dispose();
   }
 
-  Future<void> _pickDate(bool start) async {
+  Future<void> _pickDate(bool isStart) async {
+    final initial = (isStart ? _start : _end) ?? _start ?? DateTime.now();
     final picked = await showDatePicker(
       context: context,
-      initialDate: DateTime(2026, 10, 20),
+      initialDate: initial,
       firstDate: DateTime(2024),
       lastDate: DateTime(2035),
     );
-    if (picked != null) setState(() { if (start) { _start = picked; } else { _end = picked; } });
+    if (picked != null) {
+      setState(() {
+        if (isStart) {
+          _start = picked;
+        } else {
+          _end = picked;
+        }
+      });
+    }
   }
 
-  String _dateLabel(DateTime? date) => date == null ? 'Select date' : '${date.month}/${date.day}/${date.year}';
+  String _dateLabel(DateTime? date) =>
+      date == null ? 'Select date' : fmtDate(date);
+
+  String _dateSummary() {
+    final s = _start;
+    final e = _end;
+    if (s != null && e != null) return '${fmtDate(s)} – ${fmtDate(e)}';
+    if (s != null) return fmtDate(s);
+    if (e != null) return 'Until ${fmtDate(e)}';
+    return 'No date set';
+  }
+
+  List<String> _parsedTags() => _tags.text
+      .split(',')
+      .map((t) => t.trim())
+      .where((t) => t.isNotEmpty)
+      .toList();
+
+  String _statusPreview() {
+    final s = _start;
+    if (hasEnded(s, _end)) {
+      return 'This will show as EXPIRED because the date range has already passed.';
+    }
+    if (s != null && startsLater(s)) {
+      return 'This will be SCHEDULED and go live on ${fmtDate(s)}. Only you can see it until then.';
+    }
+    return 'This will show as ACTIVE.';
+  }
+
+  Future<bool> _confirmPublish() async {
+    final editing = widget.existing != null;
+    final tags = _parsedTags();
+    final office =
+        _office.text.trim().isEmpty ? 'TUP Contributor' : _office.text.trim();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Review announcement'),
+        content: SingleChildScrollView(
+          child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(_title.text.trim(),
+                    style: const TextStyle(
+                        fontSize: 15, fontWeight: FontWeight.w800)),
+                const SizedBox(height: 10),
+                Text('Category: $_category',
+                    style: const TextStyle(fontSize: 12)),
+                const SizedBox(height: 4),
+                Text('Audience: $_scope',
+                    style: const TextStyle(fontSize: 12)),
+                const SizedBox(height: 4),
+                Text('Issuing office: $office',
+                    style: const TextStyle(fontSize: 12)),
+                const SizedBox(height: 4),
+                Text('Dates: ${_dateSummary()}',
+                    style: const TextStyle(fontSize: 12)),
+                if (tags.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text('Tags: ${tags.map((t) => '#$t').join(' ')}',
+                      style: const TextStyle(fontSize: 12)),
+                ],
+                const SizedBox(height: 10),
+                Text(_statusPreview(),
+                    style: const TextStyle(
+                        fontSize: 11,
+                        color: burgundy,
+                        fontWeight: FontWeight.w600)),
+              ]),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Back')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(editing ? 'Save' : 'Publish',
+                  style: const TextStyle(color: burgundy))),
+        ],
+      ),
+    );
+    return ok == true && mounted;
+  }
+
+  Future<void> _save() async {
+    if (_title.text.trim().isEmpty || _description.text.trim().isEmpty) {
+      showMsg(context, 'Enter a title and description first.');
+      return;
+    }
+    final s = _start;
+    final e = _end;
+    if (s != null && e != null && e.isBefore(s)) {
+      showMsg(context, 'The end date must be on or after the start date.');
+      return;
+    }
+
+    final confirmed = await _confirmPublish();
+    if (!confirmed) return;
+
+    setState(() => _saving = true);
+    final data = <String, dynamic>{
+      'title': _title.text.trim(),
+      'category': _category,
+      'scope': _scope,
+      'issuing_office':
+          _office.text.trim().isEmpty ? 'TUP Contributor' : _office.text.trim(),
+      'description': _description.text.trim(),
+      'attachment_link': _attachment.text.trim(),
+      'tags': _parsedTags(),
+      'start_date': s == null ? null : Timestamp.fromDate(s),
+      'end_date': e == null ? null : Timestamp.fromDate(e),
+      'updatedAt': Timestamp.now(),
+    };
+
+    try {
+      final col = FirebaseFirestore.instance.collection('announcements');
+      final existing = widget.existing;
+      if (existing == null) {
+        await col.add({
+          ...data,
+          'status': 'active',
+          'createdAt': Timestamp.now(),
+          'createdBy': widget.user.uid,
+          'createdByEmail': widget.user.email,
+        });
+      } else {
+        await col.doc(existing.id).update(data);
+      }
+      if (!mounted) return;
+      Navigator.pop(context,
+          existing == null ? 'Announcement published.' : 'Announcement updated.');
+    } catch (err) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      showMsg(context, 'Could not save: $err');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ListView(padding: const EdgeInsets.fromLTRB(20, 16, 20, 24), children: [
-      Row(children: [
-        const Expanded(child: Text('Publish Announcement', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: ink))),
-        TextButton(onPressed: widget.onLogout, child: const Text('Log out', style: TextStyle(color: burgundy))),
-      ]),
-      const SizedBox(height: 6),
-      const Text('Create a campus update for students and staff.', style: TextStyle(fontSize: 12, color: muted)),
-      const SizedBox(height: 20),
-      const Text('Announcement Title', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
-      const SizedBox(height: 7),
-      TextField(controller: _title, decoration: const InputDecoration(hintText: 'Enter announcement title')),
-      const SizedBox(height: 16),
-      const Text('Category', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
-      const SizedBox(height: 7),
-      DropdownButtonFormField<String>(
-        value: _category,
-        items: const [
-          DropdownMenuItem(value: 'Class Suspension', child: Text('Class Suspension')),
-          DropdownMenuItem(value: 'Academic Requirements', child: Text('Academic Requirements')),
-          DropdownMenuItem(value: 'Campus Events', child: Text('Campus Events')),
-          DropdownMenuItem(value: 'Organization Updates', child: Text('Organization Updates')),
-          DropdownMenuItem(value: 'Emergency Alerts', child: Text('Emergency Alerts')),
-          DropdownMenuItem(value: 'Department Notices', child: Text('Department Notices')),
-        ],
-        onChanged: (v) => setState(() => _category = v ?? _category),
+    final editing = widget.existing != null;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(editing ? 'Edit Announcement' : 'New Announcement',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
       ),
-      const SizedBox(height: 16),
-      const Text('Issuing Office', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
-      const SizedBox(height: 7),
-      TextField(controller: _office, decoration: const InputDecoration(hintText: 'Office or organization')),
-      const SizedBox(height: 16),
-      const Text('Announcement Description', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
-      const SizedBox(height: 7),
-      TextField(controller: _description, minLines: 4, maxLines: 7, decoration: const InputDecoration(hintText: 'Enter announcement details')),
-      const SizedBox(height: 16),
-      const Text('Effective Date Range', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
-      const SizedBox(height: 8),
-      Row(children: [
-        Expanded(child: OutlinedButton.icon(onPressed: () => _pickDate(true), icon: const Icon(Icons.calendar_today, size: 15), label: Text(_dateLabel(_start), style: const TextStyle(fontSize: 11)), style: OutlinedButton.styleFrom(foregroundColor: burgundy))),
-        const SizedBox(width: 8),
-        Expanded(child: OutlinedButton.icon(onPressed: () => _pickDate(false), icon: const Icon(Icons.event, size: 15), label: Text(_dateLabel(_end), style: const TextStyle(fontSize: 11)), style: OutlinedButton.styleFrom(foregroundColor: burgundy))),
-      ]),
-      const SizedBox(height: 16),
-      OutlinedButton.icon(
-        onPressed: () => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Attachment picker can be connected later.'))),
-        icon: const Icon(Icons.attach_file),
-        label: const Text('Add attachment (demo)'),
-        style: OutlinedButton.styleFrom(foregroundColor: burgundy, alignment: Alignment.centerLeft, padding: const EdgeInsets.all(14)),
-      ),
-      const SizedBox(height: 22),
-      FilledButton.icon(
-        onPressed: () {
-          if (_title.text.trim().isEmpty || _description.text.trim().isEmpty) {
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter a title and description first.')));
-            return;
-          }
-          final dates = '${_dateLabel(_start)} – ${_dateLabel(_end)}';
-          widget.onPublished(Announcement(
-            title: _title.text.trim(),
-            category: _category,
-            office: _office.text.trim().isEmpty ? 'TUP Contributor' : _office.text.trim(),
-            dates: dates,
-            status: 'ACTIVE',
-            description: _description.text.trim(),
-            icon: Icons.campaign_outlined,
-          ));
-        },
-        icon: const Icon(Icons.publish),
-        label: const Text('Publish Announcement', style: TextStyle(fontWeight: FontWeight.w800)),
-        style: FilledButton.styleFrom(backgroundColor: burgundy, padding: const EdgeInsets.symmetric(vertical: 15)),
-      ),
-      const SizedBox(height: 10),
-      const Text('Prototype note: publishing adds this sample item to the local home feed only.', textAlign: TextAlign.center, style: TextStyle(fontSize: 10, color: muted)),
-    ]);
+      body: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+          children: [
+            const Text('Announcement Title',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 7),
+            TextField(
+                controller: _title,
+                decoration: const InputDecoration(
+                    hintText: 'Enter announcement title')),
+            const SizedBox(height: 16),
+            const Text('Category',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 7),
+            DropdownButtonFormField<String>(
+              value: _category,
+              items: kCategories
+                  .map((c) => DropdownMenuItem(value: c, child: Text(c)))
+                  .toList(),
+              onChanged: (v) => setState(() => _category = v ?? _category),
+            ),
+            const SizedBox(height: 16),
+            const Text('Audience',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 7),
+            DropdownButtonFormField<String>(
+              value: _scope,
+              items: kScopes
+                  .map((c) => DropdownMenuItem(value: c, child: Text(c)))
+                  .toList(),
+              onChanged: (v) => setState(() => _scope = v ?? _scope),
+            ),
+            const SizedBox(height: 16),
+            const Text('Issuing Office',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 7),
+            TextField(
+                controller: _office,
+                decoration: const InputDecoration(
+                    hintText: 'Office or organization')),
+            const SizedBox(height: 16),
+            const Text('Announcement Description',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 7),
+            TextField(
+                controller: _description,
+                minLines: 4,
+                maxLines: 7,
+                decoration: const InputDecoration(
+                    hintText: 'Enter announcement details')),
+            const SizedBox(height: 16),
+            const Text('Event tags (optional)',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 7),
+            TextField(
+                controller: _tags,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(
+                    hintText: 'Separate with commas, e.g. enrollment, sports',
+                    prefixIcon: Icon(Icons.tag))),
+            const SizedBox(height: 16),
+            const Text('Effective Date Range',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 4),
+            const Text(
+                'Shows from the start date and turns EXPIRED after the end date. Leave the end date blank for a one-day announcement, or leave both blank to keep it active.',
+                style: TextStyle(fontSize: 10, color: muted)),
+            const SizedBox(height: 8),
+            Row(children: [
+              Expanded(
+                  child: OutlinedButton.icon(
+                      onPressed: () => _pickDate(true),
+                      icon: const Icon(Icons.calendar_today, size: 15),
+                      label: Text(_dateLabel(_start),
+                          style: const TextStyle(fontSize: 11)),
+                      style: OutlinedButton.styleFrom(
+                          foregroundColor: burgundy))),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: OutlinedButton.icon(
+                      onPressed: () => _pickDate(false),
+                      icon: const Icon(Icons.event, size: 15),
+                      label: Text(_dateLabel(_end),
+                          style: const TextStyle(fontSize: 11)),
+                      style: OutlinedButton.styleFrom(
+                          foregroundColor: burgundy))),
+            ]),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                  color: paleRose, borderRadius: BorderRadius.circular(12)),
+              child: Row(children: [
+                const Icon(Icons.info_outline, size: 15, color: burgundy),
+                const SizedBox(width: 8),
+                Expanded(
+                    child: Text(_statusPreview(),
+                        style: const TextStyle(
+                            fontSize: 11,
+                            color: burgundy,
+                            fontWeight: FontWeight.w600))),
+              ]),
+            ),
+            if (_start != null || _end != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton(
+                    onPressed: () => setState(() {
+                          _start = null;
+                          _end = null;
+                        }),
+                    child: const Text('Clear dates',
+                        style: TextStyle(color: burgundy, fontSize: 12))),
+              ),
+            const SizedBox(height: 12),
+            const Text('Attachment link (optional)',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 7),
+            TextField(
+                controller: _attachment,
+                keyboardType: TextInputType.url,
+                decoration: const InputDecoration(
+                    hintText: 'Paste a link to a PDF or Google Drive file',
+                    prefixIcon: Icon(Icons.attach_file))),
+            const SizedBox(height: 22),
+            FilledButton.icon(
+              onPressed: _saving ? null : _save,
+              icon: _saving
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.white))
+                  : const Icon(Icons.publish),
+              label: Text(editing ? 'Save Changes' : 'Publish Announcement',
+                  style: const TextStyle(fontWeight: FontWeight.w800)),
+              style: FilledButton.styleFrom(
+                  backgroundColor: burgundy,
+                  padding: const EdgeInsets.symmetric(vertical: 15)),
+            ),
+          ]),
+    );
   }
 }
