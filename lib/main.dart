@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
@@ -8,6 +9,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'firebase_options.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:image_picker/image_picker.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -149,6 +152,7 @@ class Announcement {
   final String office;
   final String description;
   final String attachment;
+  final String imageUrl;
   final String createdBy;
   final String legacyDates;
   final List<String> tags;
@@ -164,6 +168,7 @@ class Announcement {
     required this.office,
     required this.description,
     required this.attachment,
+    this.imageUrl = '',
     required this.createdBy,
     required this.legacyDates,
     this.tags = const [],
@@ -192,6 +197,7 @@ class Announcement {
       office: '${data['issuing_office'] ?? ''}',
       description: '${data['description'] ?? ''}',
       attachment: '${data['attachment_link'] ?? ''}',
+      imageUrl: '${data['imageUrl'] ?? ''}',
       createdBy: '${data['createdBy'] ?? ''}',
       legacyDates: legacy,
       tags: rawTags is List ? rawTags.map((e) => '$e').toList() : <String>[],
@@ -667,6 +673,19 @@ class AnnouncementCard extends StatelessWidget {
                           fontWeight: FontWeight.w700))),
               StatusBadge(active: a.active, scheduled: a.isScheduled),
             ]),
+            if (a.imageUrl.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.network(
+                  a.imageUrl,
+                  width: double.infinity,
+                  height: 170,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                ),
+              ),
+            ],
             const SizedBox(height: 10),
             Text(a.title,
                 style: const TextStyle(
@@ -1017,6 +1036,18 @@ class AnnouncementDetailScreen extends StatelessWidget {
           if (a.tags.isNotEmpty) ...[
             const SizedBox(height: 12),
             TagWrap(tags: a.tags),
+          ],
+          if (a.imageUrl.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: Image.network(
+                a.imageUrl,
+                width: double.infinity,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+              ),
+            ),
           ],
           const SizedBox(height: 22),
           Text(a.description,
@@ -1404,12 +1435,16 @@ class _NotificationPreferencesScreenState
     });
   }
 
-  Future<void> _save() async {
+ 
+Future<void> _save() async {
     final prefs = await SharedPreferences.getInstance();
+
     for (final entry in _settings.entries) {
       await prefs.setBool('notif_${entry.key}', entry.value);
     }
+
     if (!mounted) return;
+
     Navigator.pop(context);
     showMsg(context, 'Preferences saved.');
   }
@@ -1983,10 +2018,15 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
   DateTime? _end;
   bool _saving = false;
 
+  XFile? _selectedImage;
+  Uint8List? _selectedImageBytes;
+  String _currentImageUrl = '';
+
   @override
   void initState() {
     super.initState();
     final e = widget.existing;
+    _currentImageUrl = e?.imageUrl ?? '';
     _title = TextEditingController(text: e?.title ?? '');
     _description = TextEditingController(text: e?.description ?? '');
     _office = TextEditingController(text: e?.office ?? 'TUP Admin');
@@ -1999,6 +2039,44 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     _start = e?.start;
     _end = e?.end;
   }
+
+  Future<void> _pickImage() async {
+  try {
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 80,
+      maxWidth: 1600,
+    );
+
+    if (picked == null) return;
+
+    final bytes = await picked.readAsBytes();
+
+    if (bytes.length > 5 * 1024 * 1024) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Please choose an image smaller than 5 MB.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+  _selectedImage = picked;
+  _selectedImageBytes = bytes;
+});
+  } catch (e) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not select image: $e')),
+      );
+    }
+  }
+}
 
   @override
   void dispose() {
@@ -2061,66 +2139,79 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
   Future<bool> _confirmPublish() async {
     final editing = widget.existing != null;
     final tags = _parsedTags();
-    final office =
-        _office.text.trim().isEmpty ? 'TUP Contributor' : _office.text.trim();
+    final office = _office.text.trim().isEmpty
+        ? 'TUP Contributor'
+        : _office.text.trim();
+
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Review announcement'),
         content: SingleChildScrollView(
           child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(_title.text.trim(),
-                    style: const TextStyle(
-                        fontSize: 15, fontWeight: FontWeight.w800)),
-                const SizedBox(height: 10),
-                Text('Category: $_category',
-                    style: const TextStyle(fontSize: 12)),
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                _title.text.trim(),
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text('Category: $_category'),
+              const SizedBox(height: 4),
+              Text('Audience: $_scope'),
+              const SizedBox(height: 4),
+              Text('Issuing office: $office'),
+              const SizedBox(height: 4),
+              Text('Dates: ${_dateSummary()}'),
+              if (tags.isNotEmpty) ...[
                 const SizedBox(height: 4),
-                Text('Audience: $_scope',
-                    style: const TextStyle(fontSize: 12)),
-                const SizedBox(height: 4),
-                Text('Issuing office: $office',
-                    style: const TextStyle(fontSize: 12)),
-                const SizedBox(height: 4),
-                Text('Dates: ${_dateSummary()}',
-                    style: const TextStyle(fontSize: 12)),
-                if (tags.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text('Tags: ${tags.map((t) => '#$t').join(' ')}',
-                      style: const TextStyle(fontSize: 12)),
-                ],
-                const SizedBox(height: 10),
-                Text(_statusPreview(),
-                    style: const TextStyle(
-                        fontSize: 11,
-                        color: burgundy,
-                        fontWeight: FontWeight.w600)),
-              ]),
+                Text('Tags: ${tags.map((t) => '#$t').join(' ')}'),
+              ],
+              const SizedBox(height: 10),
+              Text(
+                _statusPreview(),
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: burgundy,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Back')),
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Back'),
+          ),
           TextButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: Text(editing ? 'Save' : 'Publish',
-                  style: const TextStyle(color: burgundy))),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(
+              editing ? 'Save' : 'Publish',
+              style: const TextStyle(color: burgundy),
+            ),
+          ),
         ],
       ),
     );
+
     return ok == true && mounted;
   }
 
   Future<void> _save() async {
-    if (_title.text.trim().isEmpty || _description.text.trim().isEmpty) {
+    if (_title.text.trim().isEmpty ||
+        _description.text.trim().isEmpty) {
       showMsg(context, 'Enter a title and description first.');
       return;
     }
+
     final s = _start;
     final e = _end;
+
     if (s != null && e != null && e.isBefore(s)) {
       showMsg(context, 'The end date must be on or after the start date.');
       return;
@@ -2130,12 +2221,14 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     if (!confirmed) return;
 
     setState(() => _saving = true);
+
     final data = <String, dynamic>{
       'title': _title.text.trim(),
       'category': _category,
       'scope': _scope,
-      'issuing_office':
-          _office.text.trim().isEmpty ? 'TUP Contributor' : _office.text.trim(),
+      'issuing_office': _office.text.trim().isEmpty
+          ? 'TUP Contributor'
+          : _office.text.trim(),
       'description': _description.text.trim(),
       'attachment_link': _attachment.text.trim(),
       'tags': _parsedTags(),
@@ -2144,9 +2237,35 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       'updatedAt': Timestamp.now(),
     };
 
+    Reference? uploadedImageRef;
+
     try {
+      // Preserve the existing image if no replacement is selected.
+      String imageUrl = _currentImageUrl;
+
+      if (_selectedImageBytes != null && _selectedImage != null) {
+        final extension = _selectedImage!.name.split('.').last.toLowerCase();
+        final safeExtension = extension == 'png' ? 'png' : 'jpg';
+        final contentType = safeExtension == 'png' ? 'image/png' : 'image/jpeg';
+
+        uploadedImageRef = FirebaseStorage.instance.ref().child(
+          'announcement_images/${widget.user.uid}_'
+          '${DateTime.now().millisecondsSinceEpoch}.$safeExtension',
+        );
+
+        final uploadTask = await uploadedImageRef!.putData(
+          _selectedImageBytes!,
+          SettableMetadata(contentType: contentType),
+        );
+
+        imageUrl = await uploadTask.ref.getDownloadURL();
+      }
+
+      data['imageUrl'] = imageUrl;
+
       final col = FirebaseFirestore.instance.collection('announcements');
       final existing = widget.existing;
+
       if (existing == null) {
         await col.add({
           ...data,
@@ -2158,11 +2277,26 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       } else {
         await col.doc(existing.id).update(data);
       }
+
       if (!mounted) return;
-      Navigator.pop(context,
-          existing == null ? 'Announcement published.' : 'Announcement updated.');
+
+      Navigator.pop(
+        context,
+        existing == null
+            ? 'Announcement published.'
+            : 'Announcement updated.',
+      );
     } catch (err) {
+      if (uploadedImageRef != null) {
+        try {
+          await uploadedImageRef!.delete();
+        } catch (_) {
+          // Ignore cleanup errors.
+        }
+      }
+
       if (!mounted) return;
+
       setState(() => _saving = false);
       showMsg(context, 'Could not save: $err');
     }
@@ -2291,6 +2425,52 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
                         style: TextStyle(color: burgundy, fontSize: 12))),
               ),
             const SizedBox(height: 12),
+            const Text(
+  'Announcement Photo (optional)',
+  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+),
+const SizedBox(height: 7),
+
+if (_selectedImageBytes != null)
+  ClipRRect(
+    borderRadius: BorderRadius.circular(12),
+    child: Image.memory(
+      _selectedImageBytes!,
+      height: 180,
+      width: double.infinity,
+      fit: BoxFit.cover,
+    ),
+  )
+else if (_currentImageUrl.isNotEmpty)
+  ClipRRect(
+    borderRadius: BorderRadius.circular(12),
+    child: Image.network(
+      _currentImageUrl,
+      height: 180,
+      width: double.infinity,
+      fit: BoxFit.cover,
+      errorBuilder: (_, __, ___) =>
+          const Text('Could not load existing image.'),
+    ),
+  ),
+
+if (_selectedImage != null) ...[
+  const SizedBox(height: 5),
+  Text(
+    'Selected: ${_selectedImage!.name}',
+    style: const TextStyle(fontSize: 11, color: muted),
+  ),
+],
+OutlinedButton.icon(
+  onPressed: _saving ? null : _pickImage,
+  icon: const Icon(Icons.image_outlined),
+  label: const Text('Choose Photo'),
+  style: OutlinedButton.styleFrom(
+    foregroundColor: burgundy,
+  ),
+),
+
+const SizedBox(height: 16),
             const Text('Attachment link (optional)',
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
             const SizedBox(height: 7),
