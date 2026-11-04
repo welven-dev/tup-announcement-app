@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'firebase_options.dart';
 
 Future<void> main() async {
@@ -30,8 +32,6 @@ const kCategories = <String>[
 
 const kOffices = <String>[
   'TUP Admin',
-  'OSA',
-  'Registrar',
   'Student Council',
   'College Organizations',
 ];
@@ -95,6 +95,11 @@ Color categoryColor(String category) {
 void showMsg(BuildContext context, String message) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
+
+const kEmailDomain = '@tup.edu.ph';
+
+bool isTupEmail(String email) =>
+    email.trim().toLowerCase().endsWith(kEmailDomain);
 
 class TupAnnouncementApp extends StatelessWidget {
   const TupAnnouncementApp({super.key});
@@ -296,7 +301,7 @@ Widget announcementCardFor(
   return AnnouncementCard(
     announcement: a,
     onTap: () => onOpen(a),
-    onEdit: manage ? () => openAnnouncementForm(context, user!, a) : null,
+    onEdit: manage ? () => openAnnouncementForm(context, user, a) : null,
     onDelete: manage ? () => confirmDeleteAnnouncement(context, a) : null,
   );
 }
@@ -324,7 +329,7 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
-    _authSub = FirebaseAuth.instance.authStateChanges().listen(_onAuth);
+    _authSub = FirebaseAuth.instance.userChanges().listen(_onAuth);
   }
 
   @override
@@ -336,6 +341,15 @@ class _MainShellState extends State<MainShell> {
 
   void _onAuth(User? user) {
     if (!mounted) return;
+    if (user != null && _session.user?.uid == user.uid && _officerSub != null) {
+      setState(() => _session = OfficerSession(
+          user: user,
+          ready: true,
+          approved: _session.approved,
+          approvalKnown: _session.approvalKnown,
+          role: _session.role));
+      return;
+    }
     _officerSub?.cancel();
     _officerSub = null;
 
@@ -427,7 +441,10 @@ class _MainShellState extends State<MainShell> {
             onOpen: _openDetails,
           ),
           const HandbookScreen(),
-          OfficerScreen(session: session),
+          OfficerScreen(
+            session: session,
+            onRefresh: () => setState(() {}),
+          ),
         ];
 
         return Scaffold(
@@ -685,8 +702,10 @@ class AnnouncementCard extends StatelessWidget {
                 child: (edit == null && del == null)
                     ? const SizedBox.shrink()
                     : Wrap(spacing: 6, children: [
-                        if (edit != null) _cardAction(Icons.edit_outlined, 'Edit', edit),
-                        if (del != null) _cardAction(Icons.delete_outline, 'Delete', del),
+                        if (edit != null)
+                          _cardAction(Icons.edit_outlined, 'Edit', edit),
+                        if (del != null)
+                          _cardAction(Icons.delete_outline, 'Delete', del),
                       ]),
               ),
               const Text('Tap to expand',
@@ -937,17 +956,21 @@ class AnnouncementDetailScreen extends StatelessWidget {
       return;
     }
     final e = a.end ?? s;
-    final endExclusive = DateTime(e.year, e.month, e.day).add(const Duration(days: 1));
+    final endExclusive =
+        DateTime(e.year, e.month, e.day).add(const Duration(days: 1));
     final uri = Uri.https('calendar.google.com', '/calendar/render', {
       'action': 'TEMPLATE',
       'text': a.title,
       'dates': '${_ymd(s)}/${_ymd(endExclusive)}',
       'details': '${a.description}\n\nPosted by ${a.office}',
     });
-    await Clipboard.setData(ClipboardData(text: uri.toString()));
-    if (context.mounted) {
-      showMsg(context,
-          'Calendar link copied. Paste it in your browser to add the event.');
+
+    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!opened) {
+      await Clipboard.setData(ClipboardData(text: uri.toString()));
+      if (context.mounted) {
+        showMsg(context, 'Could not open Google Calendar. Link copied instead.');
+      }
     }
   }
 
@@ -1154,6 +1177,26 @@ class _EventsScreenState extends State<EventsScreen> {
   }
 }
 
+class HandbookSection {
+  final String group;
+  final String title;
+  final String text;
+  const HandbookSection(this.group, this.title, this.text);
+}
+
+IconData handbookIcon(String group) {
+  switch (group) {
+    case 'Academic Policies':
+      return Icons.school_outlined;
+    case 'Student Services':
+      return Icons.support_agent_outlined;
+    case 'Rules on Conduct and Discipline':
+      return Icons.gavel_outlined;
+    default:
+      return Icons.info_outline;
+  }
+}
+
 class HandbookScreen extends StatefulWidget {
   const HandbookScreen({super.key});
 
@@ -1163,20 +1206,37 @@ class HandbookScreen extends StatefulWidget {
 
 class _HandbookScreenState extends State<HandbookScreen> {
   final _search = TextEditingController();
-  final _topics = const [
-    ('Academic Policies', 'University rules and academic regulations',
-        Icons.school_outlined),
-    ('Code of Conduct', 'Student responsibilities and policies',
-        Icons.gavel_outlined),
-    ('Grading System', 'Understand grading and assessment',
-        Icons.grade_outlined),
-    ('Student Services', 'Counseling, support, and campus services',
-        Icons.support_agent_outlined),
-    ('Student Calendar', 'Academic calendar and important dates',
-        Icons.calendar_month_outlined),
-    ('Dress Code', 'Uniform and campus attire guidelines',
-        Icons.checkroom_outlined),
-  ];
+  List<HandbookSection> _sections = [];
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final raw = await rootBundle.loadString('assets/handbook.json');
+      final list = jsonDecode(raw) as List<dynamic>;
+      final sections = list.map((e) {
+        final m = e as Map<String, dynamic>;
+        return HandbookSection('${m['group']}', '${m['title']}', '${m['text']}');
+      }).toList();
+      if (!mounted) return;
+      setState(() {
+        _sections = sections;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
 
   @override
   void dispose() {
@@ -1184,19 +1244,75 @@ class _HandbookScreenState extends State<HandbookScreen> {
     super.dispose();
   }
 
+  String _snippet(HandbookSection s, String q) {
+    final i = s.text.toLowerCase().indexOf(q);
+    if (i < 0) return s.group;
+    final start = i - 30 < 0 ? 0 : i - 30;
+    final endRaw = i + q.length + 60;
+    final end = endRaw > s.text.length ? s.text.length : endRaw;
+    final piece = s.text.substring(start, end).replaceAll('\n', ' ');
+    return '${start > 0 ? '...' : ''}$piece${end < s.text.length ? '...' : ''}';
+  }
+
   @override
   Widget build(BuildContext context) {
-    final q = _search.text.toLowerCase();
-    final visible = _topics
-        .where((t) =>
-            t.$1.toLowerCase().contains(q) || t.$2.toLowerCase().contains(q))
-        .toList();
+    final q = _search.text.trim().toLowerCase();
+    final visible = _sections.where((s) {
+      if (q.isEmpty) return true;
+      return s.title.toLowerCase().contains(q) ||
+          s.group.toLowerCase().contains(q) ||
+          s.text.toLowerCase().contains(q);
+    }).toList();
+
+    final items = <Widget>[];
+    String? lastGroup;
+    for (final s in visible) {
+      if (q.isEmpty && s.group != lastGroup) {
+        items.add(Padding(
+          padding: const EdgeInsets.only(top: 12, bottom: 8),
+          child: Text(s.group.toUpperCase(),
+              style: const TextStyle(
+                  fontSize: 10,
+                  letterSpacing: 1,
+                  fontWeight: FontWeight.w800,
+                  color: muted)),
+        ));
+        lastGroup = s.group;
+      }
+      items.add(Card(
+        margin: const EdgeInsets.only(bottom: 10),
+        elevation: 0,
+        color: Colors.white,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: const BorderSide(color: line)),
+        child: ListTile(
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
+          leading: CircleAvatar(
+              backgroundColor: paleRose,
+              child: Icon(handbookIcon(s.group), color: burgundy, size: 20)),
+          title: Text(s.title,
+              style:
+                  const TextStyle(fontSize: 13, fontWeight: FontWeight.w800)),
+          subtitle: Text(q.isEmpty ? s.group : _snippet(s, q),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 10, color: muted)),
+          trailing: const Icon(Icons.chevron_right, color: burgundy),
+          onTap: () => Navigator.of(context).push(MaterialPageRoute(
+            builder: (_) => HandbookDetailScreen(section: s),
+          )),
+        ),
+      ));
+    }
+
     return ListView(padding: const EdgeInsets.all(20), children: [
       const Text('Student Handbook',
           style:
               TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: ink)),
       const SizedBox(height: 4),
-      const Text('Quick access to frequently referenced campus policies.',
+      const Text('TUP 2013 Revised Student Handbook.',
           style: TextStyle(color: muted, fontSize: 12)),
       const SizedBox(height: 18),
       TextField(
@@ -1204,52 +1320,52 @@ class _HandbookScreenState extends State<HandbookScreen> {
           onChanged: (_) => setState(() {}),
           decoration: const InputDecoration(
               hintText: 'Search handbook...', prefixIcon: Icon(Icons.search))),
-      const SizedBox(height: 18),
-      ...visible.map((topic) => Card(
-            margin: const EdgeInsets.only(bottom: 10),
-            elevation: 0,
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
-                side: const BorderSide(color: line)),
-            child: ListTile(
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
-              leading: CircleAvatar(
-                  backgroundColor: paleRose,
-                  child: Icon(topic.$3, color: burgundy, size: 20)),
-              title: Text(topic.$1,
-                  style: const TextStyle(
-                      fontSize: 13, fontWeight: FontWeight.w800)),
-              subtitle: Text(topic.$2,
-                  style: const TextStyle(fontSize: 10, color: muted)),
-              trailing: const Icon(Icons.chevron_right, color: burgundy),
-              onTap: () => showModalBottomSheet(
-                context: context,
-                showDragHandle: true,
-                builder: (_) => Padding(
-                  padding: const EdgeInsets.fromLTRB(22, 8, 22, 32),
-                  child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(topic.$1,
-                            style: const TextStyle(
-                                fontSize: 20, fontWeight: FontWeight.w800)),
-                        const SizedBox(height: 12),
-                        Text(
-                            '${topic.$2}.\n\nThis is placeholder handbook content. Replace it with verified text from the official TUP student handbook.',
-                            style:
-                                const TextStyle(height: 1.6, color: muted)),
-                      ]),
-                ),
-              ),
-            ),
-          )),
-      if (visible.isEmpty)
+      const SizedBox(height: 10),
+      if (_loading)
+        const Padding(
+            padding: EdgeInsets.all(28),
+            child: Center(child: CircularProgressIndicator()))
+      else if (_error != null)
+        Padding(
+            padding: const EdgeInsets.all(20),
+            child: Text('Could not load the handbook: $_error'))
+      else if (visible.isEmpty)
         const Padding(
             padding: EdgeInsets.all(20),
-            child: Text('No handbook topics found.')),
+            child: Text('No handbook topics found.'))
+      else
+        ...items,
     ]);
+  }
+}
+
+class HandbookDetailScreen extends StatelessWidget {
+  final HandbookSection section;
+  const HandbookDetailScreen({super.key, required this.section});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(section.group,
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+        children: [
+          Text(section.title,
+              style: const TextStyle(
+                  fontSize: 22,
+                  height: 1.2,
+                  fontWeight: FontWeight.w800,
+                  color: ink)),
+          const SizedBox(height: 14),
+          SelectableText(section.text,
+              style: const TextStyle(
+                  fontSize: 14, height: 1.65, color: Color(0xFF4F4A4E))),
+        ],
+      ),
+    );
   }
 }
 
@@ -1352,7 +1468,9 @@ class _NotificationPreferencesScreenState
 
 class OfficerScreen extends StatelessWidget {
   final OfficerSession session;
-  const OfficerScreen({super.key, required this.session});
+  final VoidCallback onRefresh;
+  const OfficerScreen(
+      {super.key, required this.session, required this.onRefresh});
 
   @override
   Widget build(BuildContext context) {
@@ -1394,48 +1512,46 @@ class OfficerLoginView extends StatefulWidget {
 }
 
 class _OfficerLoginViewState extends State<OfficerLoginView> {
-  final _id = TextEditingController();
+  final _email = TextEditingController();
   final _password = TextEditingController();
-  String _role = kRoles.last;
   bool _busy = false;
 
   @override
   void dispose() {
-    _id.dispose();
+    _email.dispose();
     _password.dispose();
     super.dispose();
   }
 
-  Future<void> _submit({required bool signUp}) async {
-    final email = _id.text.trim();
+  Future<void> _login() async {
+    final email = _email.text.trim();
     final pass = _password.text;
     if (email.isEmpty || pass.isEmpty) {
-      showMsg(context, 'Enter your email and password.');
-      return;
-    }
-    if (signUp && pass.length < 6) {
-      showMsg(context, 'Password must be at least 6 characters.');
+      showMsg(context, 'Enter your email and password to log in.');
       return;
     }
     setState(() => _busy = true);
     try {
-      final cred = signUp
-          ? await FirebaseAuth.instance
-              .createUserWithEmailAndPassword(email: email, password: pass)
-          : await FirebaseAuth.instance
-              .signInWithEmailAndPassword(email: email, password: pass);
+      final cred = await FirebaseAuth.instance
+          .signInWithEmailAndPassword(email: email, password: pass);
       final user = cred.user;
-      if (user != null) {
-        await ensureOfficerDoc(user, role: signUp ? _role : null);
-      }
+      if (user != null) await ensureOfficerDoc(user);
     } on FirebaseAuthException catch (e) {
-      if (mounted) {
-        showMsg(context, '${signUp ? 'Sign up' : 'Login'} failed: ${e.message}');
-      }
+      if (mounted) showMsg(context, 'Login failed: ${e.message}');
     } catch (e) {
       if (mounted) showMsg(context, 'Something went wrong: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _openSignUp() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final msg = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const SignUpScreen()),
+    );
+    if (msg != null) {
+      messenger.showSnackBar(SnackBar(content: Text(msg)));
     }
   }
 
@@ -1466,9 +1582,8 @@ class _OfficerLoginViewState extends State<OfficerLoginView> {
           style: TextStyle(fontSize: 11, color: muted)),
       const SizedBox(height: 18),
       TextField(
-          controller: _id,
+          controller: _email,
           keyboardType: TextInputType.emailAddress,
-          autofillHints: null,
           autocorrect: false,
           enableSuggestions: false,
           decoration: const InputDecoration(
@@ -1477,31 +1592,19 @@ class _OfficerLoginViewState extends State<OfficerLoginView> {
       TextField(
           controller: _password,
           obscureText: true,
-          autofillHints: null,
           autocorrect: false,
           enableSuggestions: false,
           onSubmitted: (_) {
-            if (!_busy) _submit(signUp: false);
+            if (!_busy) _login();
           },
           decoration: const InputDecoration(
               labelText: 'Password', prefixIcon: Icon(Icons.lock_outline))),
-      const SizedBox(height: 12),
-      DropdownButtonFormField<String>(
-        value: _role,
-        decoration: const InputDecoration(
-            labelText: 'Role (used when creating an account)',
-            prefixIcon: Icon(Icons.badge_outlined)),
-        items: kRoles
-            .map((r) => DropdownMenuItem(value: r, child: Text(r)))
-            .toList(),
-        onChanged: (v) => setState(() => _role = v ?? _role),
-      ),
       const SizedBox(height: 20),
       FilledButton(
         style: FilledButton.styleFrom(
             backgroundColor: burgundy,
             padding: const EdgeInsets.symmetric(vertical: 15)),
-        onPressed: _busy ? null : () => _submit(signUp: false),
+        onPressed: _busy ? null : _login,
         child: _busy
             ? const SizedBox(
                 width: 18,
@@ -1511,12 +1614,17 @@ class _OfficerLoginViewState extends State<OfficerLoginView> {
             : const Text('Log In',
                 style: TextStyle(fontWeight: FontWeight.w700)),
       ),
-      TextButton(
-        onPressed: _busy ? null : () => _submit(signUp: true),
-        child:
-            const Text('Create account', style: TextStyle(color: burgundy)),
-      ),
-      const SizedBox(height: 12),
+      const SizedBox(height: 4),
+      Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        const Text('New officer?',
+            style: TextStyle(fontSize: 12, color: muted)),
+        TextButton(
+          onPressed: _busy ? null : _openSignUp,
+          child: const Text('Create account',
+              style: TextStyle(color: burgundy, fontWeight: FontWeight.w700)),
+        ),
+      ]),
+      const SizedBox(height: 8),
       Text(
           kRequireApproval
               ? 'New accounts must be approved by an administrator before they can publish.'
@@ -1524,6 +1632,186 @@ class _OfficerLoginViewState extends State<OfficerLoginView> {
           textAlign: TextAlign.center,
           style: const TextStyle(fontSize: 10, color: muted)),
     ]);
+  }
+}
+
+class SignUpScreen extends StatefulWidget {
+  const SignUpScreen({super.key});
+
+  @override
+  State<SignUpScreen> createState() => _SignUpScreenState();
+}
+
+class _SignUpScreenState extends State<SignUpScreen> {
+  final _email = TextEditingController();
+  final _password = TextEditingController();
+  final _confirm = TextEditingController();
+  String _role = kRoles.last;
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _email.dispose();
+    _password.dispose();
+    _confirm.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final email = _email.text.trim();
+    final pass = _password.text;
+
+    if (email.isEmpty || pass.isEmpty || _confirm.text.isEmpty) {
+      setState(() => _error = 'Please fill in every field.');
+      return;
+    }
+    if (!isTupEmail(email)) {
+      setState(() => _error = 'Please sign up with your official TUP email address.');
+      return;
+    }
+    if (pass.length < 6) {
+      setState(() => _error = 'Your password must be at least 6 characters.');
+      return;
+    }
+    if (pass != _confirm.text) {
+      setState(() => _error = 'The two passwords do not match.');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final cred = await FirebaseAuth.instance
+          .createUserWithEmailAndPassword(email: email, password: pass);
+      final user = cred.user;
+      if (user != null) {
+        await ensureOfficerDoc(user, role: _role);
+      }
+      if (!mounted) return;
+      Navigator.pop(context,
+          'Account created. An administrator will approve it before you can publish.');
+    } on FirebaseAuthException catch (e) {
+      if (mounted) {
+        setState(() => _error = e.message ?? 'Could not create the account.');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Something went wrong: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Create account',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+      ),
+      body: ListView(padding: const EdgeInsets.fromLTRB(22, 8, 22, 28), children: [
+        const Text('Officer sign-up',
+            style:
+                TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: ink)),
+        const SizedBox(height: 6),
+        const Text(
+            'Use your official TUP email. An administrator will approve your account before you can publish.',
+            style: TextStyle(fontSize: 12, color: muted, height: 1.5)),
+        const SizedBox(height: 22),
+        const Text('TUP email',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 7),
+        TextField(
+            controller: _email,
+            keyboardType: TextInputType.emailAddress,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(
+                hintText: 'name@tup.edu.ph',
+                prefixIcon: Icon(Icons.mail_outline))),
+        const SizedBox(height: 16),
+        const Text('Role',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 7),
+        DropdownButtonFormField<String>(
+          value: _role,
+          decoration:
+              const InputDecoration(prefixIcon: Icon(Icons.badge_outlined)),
+          items: kRoles
+              .map((r) => DropdownMenuItem(value: r, child: Text(r)))
+              .toList(),
+          onChanged: (v) => setState(() => _role = v ?? _role),
+        ),
+        const SizedBox(height: 16),
+        const Text('Password',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 7),
+        TextField(
+            controller: _password,
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(
+                hintText: 'At least 6 characters',
+                prefixIcon: Icon(Icons.lock_outline))),
+        const SizedBox(height: 16),
+        const Text('Confirm password',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 7),
+        TextField(
+            controller: _confirm,
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            onSubmitted: (_) {
+              if (!_busy) _submit();
+            },
+            decoration: const InputDecoration(
+                hintText: 'Type your password again',
+                prefixIcon: Icon(Icons.lock_outline))),
+        if (_error != null) ...[
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: paleRose, borderRadius: BorderRadius.circular(12)),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.error_outline, size: 16, color: burgundy),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: Text(_error!,
+                      style: const TextStyle(
+                          fontSize: 12,
+                          color: burgundy,
+                          fontWeight: FontWeight.w600))),
+            ]),
+          ),
+        ],
+        const SizedBox(height: 22),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          style: FilledButton.styleFrom(
+              backgroundColor: burgundy,
+              padding: const EdgeInsets.symmetric(vertical: 15)),
+          child: _busy
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2, color: Colors.white))
+              : const Text('Create account',
+                  style: TextStyle(fontWeight: FontWeight.w800)),
+        ),
+        const SizedBox(height: 8),
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context),
+          child: const Text('Back to login',
+              style: TextStyle(color: burgundy)),
+        ),
+      ]),
+    );
   }
 }
 
