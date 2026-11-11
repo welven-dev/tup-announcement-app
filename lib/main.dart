@@ -33,13 +33,41 @@ const kCategories = <String>[
   'Emergency Alerts',
 ];
 
+const kEventCategories = <String>[
+  'Campus Events',
+  'Organization Updates',
+];
+
+const kAcademicCategories = <String>[
+  'Class Suspension',
+  'Academic Requirements',
+  'Department Notices',
+  'Emergency Alerts',
+];
+
+bool isEventCategory(String category) => kEventCategories.contains(category);
+
 const kOffices = <String>[
   'TUP Admin',
   'Student Council',
   'College Organizations',
 ];
 
-const kScopes = <String>['University', 'College', 'Clubs'];
+const kScopes = <String>['University', 'Department', 'Clubs'];
+
+const kDepartments = <String>[
+  'College of Architecture and Fine Arts',
+  'College of Engineering',
+  'College of Industrial Education',
+  'College of Industrial Technology',
+  'College of Liberal Arts',
+  'College of Science',
+];
+
+const kClubs = <String>[
+  'Student Council',
+  'College Organizations',
+];
 
 const kRoles = <String>[
   'School Administrator',
@@ -149,6 +177,8 @@ class Announcement {
   final String title;
   final String category;
   final String scope;
+  final String department;
+  final String club;
   final String office;
   final String description;
   final String attachment;
@@ -165,6 +195,8 @@ class Announcement {
     required this.title,
     required this.category,
     required this.scope,
+    this.department = '',
+    this.club = '',
     required this.office,
     required this.description,
     required this.attachment,
@@ -189,11 +221,16 @@ class Announcement {
 
     final rawTags = data['tags'];
 
+    String scope = '${data['scope'] ?? 'University'}';
+    if (scope == 'College') scope = 'Department';
+
     return Announcement(
       id: doc.id,
       title: '${data['title'] ?? ''}',
       category: '${data['category'] ?? ''}',
-      scope: '${data['scope'] ?? 'University'}',
+      scope: scope,
+      department: '${data['department'] ?? ''}',
+      club: '${data['club'] ?? ''}',
       office: '${data['issuing_office'] ?? ''}',
       description: '${data['description'] ?? ''}',
       attachment: '${data['attachment_link'] ?? ''}',
@@ -213,7 +250,19 @@ class Announcement {
 
   bool get active => !isExpired;
 
+  bool get isEvent => isEventCategory(category);
+
   String get status => isExpired ? 'EXPIRED' : 'ACTIVE';
+
+  String get audience {
+    if (scope == 'Department') {
+      return department.isEmpty ? 'Department' : department;
+    }
+    if (scope == 'Clubs') {
+      return club.isEmpty ? 'Clubs' : club;
+    }
+    return 'University-wide';
+  }
 
   String get dates {
     final s = start;
@@ -230,6 +279,51 @@ class Announcement {
     if (c != null) return 'Posted ${fmtDate(c)}';
     return 'No date set';
   }
+}
+
+class UserPrefs {
+  final bool done;
+  final String department;
+  final List<String> clubs;
+
+  const UserPrefs({
+    this.done = false,
+    this.department = '',
+    this.clubs = const [],
+  });
+
+  bool receives(Announcement a) {
+    if (a.scope == 'Department') {
+      return a.department.isEmpty || a.department == department;
+    }
+    if (a.scope == 'Clubs') {
+      return a.club.isEmpty || clubs.contains(a.club);
+    }
+    return true;
+  }
+
+  String get summary {
+    final parts = <String>['University-wide'];
+    if (department.isNotEmpty) parts.add(department);
+    parts.addAll(clubs);
+    return parts.join(' • ');
+  }
+}
+
+Future<UserPrefs> loadUserPrefs() async {
+  final p = await SharedPreferences.getInstance();
+  return UserPrefs(
+    done: p.getBool('pref_done') ?? false,
+    department: p.getString('pref_department') ?? '',
+    clubs: p.getStringList('pref_clubs') ?? <String>[],
+  );
+}
+
+Future<void> saveUserPrefs(UserPrefs prefs) async {
+  final p = await SharedPreferences.getInstance();
+  await p.setBool('pref_done', prefs.done);
+  await p.setString('pref_department', prefs.department);
+  await p.setStringList('pref_clubs', prefs.clubs);
 }
 
 class OfficerSession {
@@ -322,6 +416,7 @@ class MainShell extends StatefulWidget {
 class _MainShellState extends State<MainShell> {
   int _tab = 0;
   OfficerSession _session = const OfficerSession();
+  UserPrefs? _prefs;
   bool _freshLogin = false;
   StreamSubscription<User?>? _authSub;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _officerSub;
@@ -336,6 +431,7 @@ class _MainShellState extends State<MainShell> {
   void initState() {
     super.initState();
     _authSub = FirebaseAuth.instance.userChanges().listen(_onAuth);
+    _loadPrefs();
   }
 
   @override
@@ -343,6 +439,28 @@ class _MainShellState extends State<MainShell> {
     _authSub?.cancel();
     _officerSub?.cancel();
     super.dispose();
+  }
+
+  Future<void> _loadPrefs() async {
+    final p = await loadUserPrefs();
+    if (!mounted) return;
+    setState(() => _prefs = p);
+  }
+
+  void _setPrefs(UserPrefs p) {
+    saveUserPrefs(p);
+    setState(() => _prefs = p);
+  }
+
+  void _editPrefs() {
+    final current = _prefs ?? const UserPrefs();
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => PersonalizationScreen(
+        initial: current,
+        firstRun: false,
+        onSaved: _setPrefs,
+      ),
+    ));
   }
 
   void _onAuth(User? user) {
@@ -414,6 +532,22 @@ class _MainShellState extends State<MainShell> {
 
   @override
   Widget build(BuildContext context) {
+    final prefs = _prefs;
+    if (prefs == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (!prefs.done) {
+      return Scaffold(
+        body: SafeArea(
+          child: PersonalizationScreen(
+            initial: prefs,
+            firstRun: true,
+            onSaved: _setPrefs,
+          ),
+        ),
+      );
+    }
+
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: _stream,
       builder: (context, snap) {
@@ -426,12 +560,14 @@ class _MainShellState extends State<MainShell> {
         final session = _session;
 
         final pages = [
-          HomeScreen(
+          AcademicsScreen(
             announcements: all,
             loading: loading,
             error: error,
             offline: offline,
             session: session,
+            prefs: prefs,
+            onEditPrefs: _editPrefs,
             onOpen: _openDetails,
             onOpenNotifications: () => Navigator.push(
               context,
@@ -463,9 +599,9 @@ class _MainShellState extends State<MainShell> {
             height: 68,
             destinations: [
               const NavigationDestination(
-                  icon: Icon(Icons.home_outlined),
-                  selectedIcon: Icon(Icons.home),
-                  label: 'Home'),
+                  icon: Icon(Icons.school_outlined),
+                  selectedIcon: Icon(Icons.school),
+                  label: 'Academics'),
               const NavigationDestination(
                   icon: Icon(Icons.event_outlined),
                   selectedIcon: Icon(Icons.event),
@@ -482,6 +618,179 @@ class _MainShellState extends State<MainShell> {
           ),
         );
       },
+    );
+  }
+}
+
+class PersonalizationScreen extends StatefulWidget {
+  final UserPrefs initial;
+  final bool firstRun;
+  final ValueChanged<UserPrefs> onSaved;
+
+  const PersonalizationScreen({
+    super.key,
+    required this.initial,
+    required this.firstRun,
+    required this.onSaved,
+  });
+
+  @override
+  State<PersonalizationScreen> createState() => _PersonalizationScreenState();
+}
+
+class _PersonalizationScreenState extends State<PersonalizationScreen> {
+  late String _department;
+  late Set<String> _clubs;
+
+  @override
+  void initState() {
+    super.initState();
+    _department = widget.initial.department;
+    _clubs = widget.initial.clubs.toSet();
+  }
+
+  void _save() {
+    widget.onSaved(UserPrefs(
+      done: true,
+      department: _department,
+      clubs: _clubs.toList(),
+    ));
+    if (!widget.firstRun) Navigator.pop(context);
+  }
+
+  void _skip() {
+    widget.onSaved(const UserPrefs(done: true));
+  }
+
+  Widget _chipLabel(String text, bool selected) => Text(text,
+      style: TextStyle(
+          color: selected ? Colors.white : ink,
+          fontSize: 12,
+          fontWeight: FontWeight.w600));
+
+  @override
+  Widget build(BuildContext context) {
+    final content = ListView(
+      padding: const EdgeInsets.fromLTRB(22, 22, 22, 28),
+      children: [
+        if (widget.firstRun) ...[
+          const SizedBox(height: 10),
+          const Center(
+              child: CircleAvatar(
+                  radius: 34,
+                  backgroundColor: paleRose,
+                  child: Icon(Icons.school_outlined,
+                      size: 34, color: burgundy))),
+          const SizedBox(height: 18),
+          const Text('Welcome to TUP Campus Updates',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  fontSize: 22, fontWeight: FontWeight.w800, color: ink)),
+          const SizedBox(height: 8),
+          const Text(
+              'Tell us your department and the organizations you belong to, so Academics shows the announcements that matter to you.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: muted, height: 1.5)),
+          const SizedBox(height: 26),
+        ],
+        const Text('Your department',
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 4),
+        const Text('Pick one, or leave it empty if you are not in a department.',
+            style: TextStyle(fontSize: 11, color: muted)),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: kDepartments.map((d) {
+            final selected = _department == d;
+            return ChoiceChip(
+              label: _chipLabel(d, selected),
+              selected: selected,
+              showCheckmark: false,
+              selectedColor: burgundy,
+              backgroundColor: Colors.white,
+              side: BorderSide(color: selected ? burgundy : line),
+              onSelected: (_) =>
+                  setState(() => _department = selected ? '' : d),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 24),
+        const Text('Your organizations',
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 4),
+        const Text('Pick every one you belong to or want updates from.',
+            style: TextStyle(fontSize: 11, color: muted)),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: kClubs.map((c) {
+            final selected = _clubs.contains(c);
+            return FilterChip(
+              label: _chipLabel(c, selected),
+              selected: selected,
+              showCheckmark: false,
+              selectedColor: burgundy,
+              backgroundColor: Colors.white,
+              side: BorderSide(color: selected ? burgundy : line),
+              onSelected: (v) => setState(() {
+                if (v) {
+                  _clubs.add(c);
+                } else {
+                  _clubs.remove(c);
+                }
+              }),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 22),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+              color: paleRose, borderRadius: BorderRadius.circular(12)),
+          child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.info_outline, size: 15, color: burgundy),
+                SizedBox(width: 8),
+                Expanded(
+                    child: Text(
+                        'University-wide announcements are shown to everyone. The Events tab is open to everyone too, even for clubs you do not follow.',
+                        style: TextStyle(
+                            fontSize: 11,
+                            color: burgundy,
+                            height: 1.5,
+                            fontWeight: FontWeight.w600))),
+              ]),
+        ),
+        const SizedBox(height: 22),
+        FilledButton(
+          style: FilledButton.styleFrom(
+              backgroundColor: burgundy,
+              padding: const EdgeInsets.symmetric(vertical: 15)),
+          onPressed: _save,
+          child: Text(widget.firstRun ? 'Save and continue' : 'Save',
+              style: const TextStyle(fontWeight: FontWeight.w800)),
+        ),
+        if (widget.firstRun)
+          TextButton(
+            onPressed: _skip,
+            child: const Text('Skip for now',
+                style: TextStyle(color: burgundy)),
+          ),
+      ],
+    );
+
+    if (widget.firstRun) return content;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('My department and organizations',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+      ),
+      body: content,
     );
   }
 }
@@ -711,6 +1020,14 @@ class AnnouncementCard extends StatelessWidget {
                   child: Text(a.office,
                       style: const TextStyle(fontSize: 10, color: muted))),
             ]),
+            const SizedBox(height: 4),
+            Row(children: [
+              const Icon(Icons.groups_outlined, size: 12, color: muted),
+              const SizedBox(width: 5),
+              Expanded(
+                  child: Text(a.audience,
+                      style: const TextStyle(fontSize: 10, color: muted))),
+            ]),
             if (a.tags.isNotEmpty) ...[
               const SizedBox(height: 8),
               TagWrap(tags: a.tags),
@@ -742,34 +1059,39 @@ class AnnouncementCard extends StatelessWidget {
   }
 }
 
-class HomeScreen extends StatefulWidget {
+class AcademicsScreen extends StatefulWidget {
   final List<Announcement> announcements;
   final bool loading;
   final String? error;
   final bool offline;
   final OfficerSession session;
+  final UserPrefs prefs;
+  final VoidCallback onEditPrefs;
   final ValueChanged<Announcement> onOpen;
   final VoidCallback onOpenNotifications;
 
-  const HomeScreen({
+  const AcademicsScreen({
     super.key,
     required this.announcements,
     required this.loading,
     required this.error,
     this.offline = false,
     required this.session,
+    required this.prefs,
+    required this.onEditPrefs,
     required this.onOpen,
     required this.onOpenNotifications,
   });
 
   @override
-  State<HomeScreen> createState() => _HomeScreenState();
+  State<AcademicsScreen> createState() => _AcademicsScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _AcademicsScreenState extends State<AcademicsScreen> {
   final _search = TextEditingController();
   String _filter = 'All';
   String? _value;
+  String _scope = 'All';
 
   static const _menuFilters = ['Category', 'Issuing Office', 'Status'];
 
@@ -782,7 +1104,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<String> _optionsFor(String filter) {
     switch (filter) {
       case 'Category':
-        return kCategories;
+        return kAcademicCategories;
       case 'Issuing Office':
         final extra = widget.announcements
             .map((a) => a.office)
@@ -849,9 +1171,14 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final q = _search.text.trim().toLowerCase();
     final session = widget.session;
+    final prefs = widget.prefs;
 
     final filtered = widget.announcements.where((a) {
-      if (a.isScheduled && !session.canManage(a)) return false;
+      if (a.isEvent) return false;
+      final mine = session.canManage(a);
+      if (a.isScheduled && !mine) return false;
+      if (!mine && !prefs.receives(a)) return false;
+      if (_scope != 'All' && a.scope != _scope) return false;
       final v = _value;
       if (v != null) {
         if (_filter == 'Category' && a.category != v) return false;
@@ -877,13 +1204,13 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             const Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('TUP Campus Updates',
+                Text('Academics',
                     style: TextStyle(
                         fontSize: 22,
                         fontWeight: FontWeight.w800,
                         color: ink)),
                 SizedBox(height: 3),
-                Text('Technological University of the Philippines',
+                Text('Class suspensions and academic notices',
                     style: TextStyle(fontSize: 11, color: muted)),
               ]),
             ),
@@ -895,7 +1222,32 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
-        const SizedBox(height: 18),
+        const SizedBox(height: 14),
+        InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: widget.onEditPrefs,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+                color: paleRose, borderRadius: BorderRadius.circular(12)),
+            child: Row(children: [
+              const Icon(Icons.tune, size: 16, color: burgundy),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: Text('Showing: ${prefs.summary}',
+                      style: const TextStyle(
+                          fontSize: 11,
+                          color: burgundy,
+                          fontWeight: FontWeight.w700))),
+              const Text('Edit',
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: burgundy,
+                      fontWeight: FontWeight.w800)),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 14),
         if (widget.offline) ...[
           const OfflineBanner(),
           const SizedBox(height: 14),
@@ -913,6 +1265,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
         const SizedBox(height: 14),
+        scopeChips(_scope, (v) => setState(() => _scope = v)),
+        const SizedBox(height: 10),
         _filterButtons(),
         const SizedBox(height: 20),
         Row(
@@ -1033,6 +1387,14 @@ class AnnouncementDetailScreen extends StatelessWidget {
                 child: Text(a.dates,
                     style: const TextStyle(fontSize: 12, color: muted))),
           ]),
+          const SizedBox(height: 6),
+          Row(children: [
+            const Icon(Icons.groups_outlined, size: 16, color: muted),
+            const SizedBox(width: 7),
+            Expanded(
+                child: Text(a.audience,
+                    style: const TextStyle(fontSize: 12, color: muted))),
+          ]),
           if (a.tags.isNotEmpty) ...[
             const SizedBox(height: 12),
             TagWrap(tags: a.tags),
@@ -1143,9 +1505,7 @@ class _EventsScreenState extends State<EventsScreen> {
   Widget build(BuildContext context) {
     final session = widget.session;
     final events = widget.announcements.where((a) {
-      final isEvent =
-          a.category == 'Campus Events' || a.category == 'Organization Updates';
-      if (!isEvent) return false;
+      if (!a.isEvent) return false;
       if (a.isScheduled && !session.canManage(a)) return false;
       if (_scope != 'All' && a.scope != _scope) return false;
       return true;
@@ -1156,7 +1516,7 @@ class _EventsScreenState extends State<EventsScreen> {
           style:
               TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: ink)),
       const SizedBox(height: 4),
-      const Text('Discover what is happening around TUP.',
+      const Text('Open to everyone, whatever your department or club.',
           style: TextStyle(color: muted, fontSize: 12)),
       const SizedBox(height: 18),
       scopeChips(_scope, (v) => setState(() => _scope = v)),
@@ -1177,7 +1537,7 @@ class _EventsScreenState extends State<EventsScreen> {
                       fontWeight: FontWeight.w800)),
               SizedBox(height: 5),
               Text(
-                  'University-wide, college-specific, and student organization events.',
+                  'Food bazaars, pop-up stores, club activities, donation drives and more.',
                   style: TextStyle(
                       color: Colors.white70, fontSize: 12, height: 1.4)),
             ]),
@@ -1435,8 +1795,7 @@ class _NotificationPreferencesScreenState
     });
   }
 
- 
-Future<void> _save() async {
+  Future<void> _save() async {
     final prefs = await SharedPreferences.getInstance();
 
     for (final entry in _settings.entries) {
@@ -1979,7 +2338,7 @@ class OfficerAccountView extends StatelessWidget {
       ),
       const SizedBox(height: 12),
       const Text(
-          'To edit or delete your announcements, go to Home. Your posts have Edit and Delete buttons.',
+          'To edit or delete your announcements, go to Academics or Events. Your posts have Edit and Delete buttons.',
           textAlign: TextAlign.center,
           style: TextStyle(fontSize: 11, color: muted, height: 1.5)),
       const SizedBox(height: 22),
@@ -2014,6 +2373,8 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
   late final TextEditingController _tags;
   late String _category;
   late String _scope;
+  late String _department;
+  late String _club;
   DateTime? _start;
   DateTime? _end;
   bool _saving = false;
@@ -2036,47 +2397,51 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
         ? e.category
         : kCategories.first;
     _scope = (e != null && kScopes.contains(e.scope)) ? e.scope : kScopes.first;
+    _department = (e != null && kDepartments.contains(e.department))
+        ? e.department
+        : kDepartments.first;
+    _club = (e != null && kClubs.contains(e.club)) ? e.club : kClubs.first;
     _start = e?.start;
     _end = e?.end;
   }
 
   Future<void> _pickImage() async {
-  try {
-    final picked = await ImagePicker().pickImage(
-      source: ImageSource.gallery,
-      imageQuality: 80,
-      maxWidth: 1600,
-    );
+    try {
+      final picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 80,
+        maxWidth: 1600,
+      );
 
-    if (picked == null) return;
+      if (picked == null) return;
 
-    final bytes = await picked.readAsBytes();
+      final bytes = await picked.readAsBytes();
 
-    if (bytes.length > 5 * 1024 * 1024) {
+      if (bytes.length > 5 * 1024 * 1024) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Please choose an image smaller than 5 MB.'),
+            ),
+          );
+        }
+        return;
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        _selectedImage = picked;
+        _selectedImageBytes = bytes;
+      });
+    } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Please choose an image smaller than 5 MB.'),
-          ),
+          SnackBar(content: Text('Could not select image: $e')),
         );
       }
-      return;
-    }
-
-    if (!mounted) return;
-
-    setState(() {
-  _selectedImage = picked;
-  _selectedImageBytes = bytes;
-});
-  } catch (e) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not select image: $e')),
-      );
     }
   }
-}
 
   @override
   void dispose() {
@@ -2136,12 +2501,19 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     return 'This will show as ACTIVE.';
   }
 
+  String _audienceText() {
+    if (_scope == 'Department') return 'Department – $_department';
+    if (_scope == 'Clubs') return 'Clubs – $_club';
+    return 'University-wide';
+  }
+
   Future<bool> _confirmPublish() async {
     final editing = widget.existing != null;
     final tags = _parsedTags();
     final office = _office.text.trim().isEmpty
         ? 'TUP Contributor'
         : _office.text.trim();
+    final tab = isEventCategory(_category) ? 'Events' : 'Academics';
 
     final ok = await showDialog<bool>(
       context: context,
@@ -2162,7 +2534,9 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
               const SizedBox(height: 10),
               Text('Category: $_category'),
               const SizedBox(height: 4),
-              Text('Audience: $_scope'),
+              Text('Shown in: $tab tab'),
+              const SizedBox(height: 4),
+              Text('Audience: ${_audienceText()}'),
               const SizedBox(height: 4),
               Text('Issuing office: $office'),
               const SizedBox(height: 4),
@@ -2226,6 +2600,8 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       'title': _title.text.trim(),
       'category': _category,
       'scope': _scope,
+      'department': _scope == 'Department' ? _department : '',
+      'club': _scope == 'Clubs' ? _club : '',
       'issuing_office': _office.text.trim().isEmpty
           ? 'TUP Contributor'
           : _office.text.trim(),
@@ -2240,7 +2616,6 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     Reference? uploadedImageRef;
 
     try {
-      // Preserve the existing image if no replacement is selected.
       String imageUrl = _currentImageUrl;
 
       if (_selectedImageBytes != null && _selectedImage != null) {
@@ -2253,7 +2628,7 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
           '${DateTime.now().millisecondsSinceEpoch}.$safeExtension',
         );
 
-        final uploadTask = await uploadedImageRef!.putData(
+        final uploadTask = await uploadedImageRef.putData(
           _selectedImageBytes!,
           SettableMetadata(contentType: contentType),
         );
@@ -2289,10 +2664,8 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     } catch (err) {
       if (uploadedImageRef != null) {
         try {
-          await uploadedImageRef!.delete();
-        } catch (_) {
-          // Ignore cleanup errors.
-        }
+          await uploadedImageRef.delete();
+        } catch (_) {}
       }
 
       if (!mounted) return;
@@ -2331,6 +2704,12 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
                   .toList(),
               onChanged: (v) => setState(() => _category = v ?? _category),
             ),
+            const SizedBox(height: 6),
+            Text(
+                isEventCategory(_category)
+                    ? 'This goes to the Events tab and is shown to everyone.'
+                    : 'This goes to the Academics tab and only reaches the chosen audience.',
+                style: const TextStyle(fontSize: 10, color: muted)),
             const SizedBox(height: 16),
             const Text('Audience',
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
@@ -2342,6 +2721,35 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
                   .toList(),
               onChanged: (v) => setState(() => _scope = v ?? _scope),
             ),
+            if (_scope == 'Department') ...[
+              const SizedBox(height: 16),
+              const Text('Department',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 7),
+              DropdownButtonFormField<String>(
+                value: _department,
+                isExpanded: true,
+                items: kDepartments
+                    .map((d) => DropdownMenuItem(value: d, child: Text(d)))
+                    .toList(),
+                onChanged: (v) =>
+                    setState(() => _department = v ?? _department),
+              ),
+            ],
+            if (_scope == 'Clubs') ...[
+              const SizedBox(height: 16),
+              const Text('Club or organization',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 7),
+              DropdownButtonFormField<String>(
+                value: _club,
+                isExpanded: true,
+                items: kClubs
+                    .map((c) => DropdownMenuItem(value: c, child: Text(c)))
+                    .toList(),
+                onChanged: (v) => setState(() => _club = v ?? _club),
+              ),
+            ],
             const SizedBox(height: 16),
             const Text('Issuing Office',
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
@@ -2426,51 +2834,48 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
               ),
             const SizedBox(height: 12),
             const Text(
-  'Announcement Photo (optional)',
-  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
-),
-const SizedBox(height: 7),
-
-if (_selectedImageBytes != null)
-  ClipRRect(
-    borderRadius: BorderRadius.circular(12),
-    child: Image.memory(
-      _selectedImageBytes!,
-      height: 180,
-      width: double.infinity,
-      fit: BoxFit.cover,
-    ),
-  )
-else if (_currentImageUrl.isNotEmpty)
-  ClipRRect(
-    borderRadius: BorderRadius.circular(12),
-    child: Image.network(
-      _currentImageUrl,
-      height: 180,
-      width: double.infinity,
-      fit: BoxFit.cover,
-      errorBuilder: (_, __, ___) =>
-          const Text('Could not load existing image.'),
-    ),
-  ),
-
-if (_selectedImage != null) ...[
-  const SizedBox(height: 5),
-  Text(
-    'Selected: ${_selectedImage!.name}',
-    style: const TextStyle(fontSize: 11, color: muted),
-  ),
-],
-OutlinedButton.icon(
-  onPressed: _saving ? null : _pickImage,
-  icon: const Icon(Icons.image_outlined),
-  label: const Text('Choose Photo'),
-  style: OutlinedButton.styleFrom(
-    foregroundColor: burgundy,
-  ),
-),
-
-const SizedBox(height: 16),
+              'Announcement Photo (optional)',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 7),
+            if (_selectedImageBytes != null)
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.memory(
+                  _selectedImageBytes!,
+                  height: 180,
+                  width: double.infinity,
+                  fit: BoxFit.cover,
+                ),
+              )
+            else if (_currentImageUrl.isNotEmpty)
+              ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.network(
+                  _currentImageUrl,
+                  height: 180,
+                  width: double.infinity,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) =>
+                      const Text('Could not load existing image.'),
+                ),
+              ),
+            if (_selectedImage != null) ...[
+              const SizedBox(height: 5),
+              Text(
+                'Selected: ${_selectedImage!.name}',
+                style: const TextStyle(fontSize: 11, color: muted),
+              ),
+            ],
+            OutlinedButton.icon(
+              onPressed: _saving ? null : _pickImage,
+              icon: const Icon(Icons.image_outlined),
+              label: const Text('Choose Photo'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: burgundy,
+              ),
+            ),
+            const SizedBox(height: 16),
             const Text('Attachment link (optional)',
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
             const SizedBox(height: 7),
