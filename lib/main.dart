@@ -1,17 +1,20 @@
 import 'dart:typed_data';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show Random;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'firebase_options.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:image_picker/image_picker.dart';
-
+import 'package:otp/otp.dart';
+ 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(
@@ -21,40 +24,44 @@ Future<void> main() async {
       const Settings(persistenceEnabled: true);
   runApp(const TupAnnouncementApp());
 }
-
+ 
 const bool kRequireApproval = true;
-
+ 
 const kCategories = <String>[
   'Class Suspension',
   'Academic Requirements',
   'Campus Events',
-  'Organization Updates',
   'Department Notices',
   'Emergency Alerts',
 ];
-
+ 
 const kEventCategories = <String>[
   'Campus Events',
-  'Organization Updates',
 ];
-
+ 
 const kAcademicCategories = <String>[
   'Class Suspension',
   'Academic Requirements',
   'Department Notices',
   'Emergency Alerts',
 ];
-
-bool isEventCategory(String category) => kEventCategories.contains(category);
-
+ 
+const kUrgentCategories = <String>[
+  'Class Suspension',
+  'Emergency Alerts',
+];
+ 
+bool isEventCategory(String category) =>
+    kEventCategories.contains(category) || category == 'Organization Updates';
+ 
 const kOffices = <String>[
   'TUP Admin',
-  'Student Council',
-  'College Organizations',
+  'Department Head',
+  'Student Organization',
 ];
-
+ 
 const kScopes = <String>['University', 'Department', 'Clubs'];
-
+ 
 const kDepartments = <String>[
   'College of Architecture and Fine Arts',
   'College of Engineering',
@@ -63,18 +70,51 @@ const kDepartments = <String>[
   'College of Liberal Arts',
   'College of Science',
 ];
-
+ 
 const kClubs = <String>[
   'Student Council',
   'College Organizations',
+  'TUP AWS',
+  'TUP GEAR',
+  'TUP Grayhawks',
+  'TUP Compass',
 ];
-
+ 
 const kRoles = <String>[
   'School Administrator',
   'Department Head',
   'Student Org Officer',
 ];
-
+ 
+const kRoleScopes = <String, List<String>>{
+  'School Administrator': ['University', 'Department', 'Clubs'],
+  'Department Head': ['Department'],
+  'Student Org Officer': ['Clubs'],
+};
+ 
+const kRoleCategories = <String, List<String>>{
+  'School Administrator': kCategories,
+  'Department Head': [
+    'Class Suspension',
+    'Academic Requirements',
+    'Campus Events',
+    'Department Notices',
+  ],
+  'Student Org Officer': kEventCategories,
+};
+ 
+const kRoleOffices = <String, String>{
+  'School Administrator': 'TUP Admin',
+  'Department Head': 'Department Head',
+  'Student Org Officer': 'Student Organization',
+};
+ 
+const kNotifDefaults = <String, bool>{
+  'Class Suspensions': true,
+  'Emergency Alerts': true,
+  'Campus Events': true,
+};
+ 
 const burgundy = Color(0xFF850018);
 const burgundyDark = Color(0xFF650012);
 const paleRose = Color(0xFFF8E9EC);
@@ -82,30 +122,30 @@ const ink = Color(0xFF242124);
 const muted = Color(0xFF777178);
 const line = Color(0xFFECE7E9);
 const canvas = Color(0xFFFFFEFE);
-
+ 
 const _months = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
 ];
-
+ 
 String fmtDate(DateTime d) => '${_months[d.month - 1]} ${d.day}, ${d.year}';
-
+ 
 String _ymd(DateTime d) =>
     '${d.year}${d.month.toString().padLeft(2, '0')}${d.day.toString().padLeft(2, '0')}';
-
+ 
 DateTime _endOfDay(DateTime d) => DateTime(d.year, d.month, d.day, 23, 59, 59);
-
+ 
 bool hasEnded(DateTime? start, DateTime? end) {
   final last = end ?? start;
   if (last == null) return false;
   return DateTime.now().isAfter(_endOfDay(last));
 }
-
+ 
 bool startsLater(DateTime? start) {
   if (start == null) return false;
   return DateTime.now().isBefore(DateTime(start.year, start.month, start.day));
 }
-
+ 
 Color categoryColor(String category) {
   switch (category) {
     case 'Academic Requirements':
@@ -122,19 +162,71 @@ Color categoryColor(String category) {
       return const Color(0xFFB56B18);
   }
 }
-
+ 
 void showMsg(BuildContext context, String message) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
-
+ 
 const kEmailDomain = '@tup.edu.ph';
-
+ 
 bool isTupEmail(String email) =>
     email.trim().toLowerCase().endsWith(kEmailDomain);
-
+ 
+String newTotpSecret() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  final r = Random.secure();
+  return List.generate(16, (_) => chars[r.nextInt(chars.length)]).join();
+}
+ 
+bool verifyTotp(String secret, String input) {
+  final code = input.trim();
+  if (code.length != 6) return false;
+  final now = DateTime.now().millisecondsSinceEpoch;
+  for (final offset in const [-30000, 0, 30000]) {
+    final expected = OTP.generateTOTPCodeString(secret, now + offset,
+        algorithm: Algorithm.SHA1, isGoogle: true);
+    if (expected == code) return true;
+  }
+  return false;
+}
+ 
+String topicSlug(String s) => s
+    .toLowerCase()
+    .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+    .replaceAll(RegExp(r'^-+|-+$'), '');
+ 
+Future<void> syncPushTopics() async {
+  try {
+    final p = await SharedPreferences.getInstance();
+    final prefs = await loadUserPrefs();
+    bool on(String key) => p.getBool('notif_$key') ?? kNotifDefaults[key]!;
+ 
+    final want = <String>{'uni'};
+    if (on('Class Suspensions')) want.add('urgent_class-suspension');
+    if (on('Emergency Alerts')) want.add('urgent_emergency-alerts');
+    if (on('Campus Events')) want.add('events_campus-events');
+    if (prefs.department.isNotEmpty) {
+      want.add('dept_${topicSlug(prefs.department)}');
+    }
+    for (final c in prefs.clubs) {
+      want.add('club_${topicSlug(c)}');
+    }
+ 
+    final old = (p.getStringList('push_topics') ?? <String>[]).toSet();
+    final fm = FirebaseMessaging.instance;
+    for (final t in old.difference(want)) {
+      await fm.unsubscribeFromTopic(t);
+    }
+    for (final t in want.difference(old)) {
+      await fm.subscribeToTopic(t);
+    }
+    await p.setStringList('push_topics', want.toList());
+  } catch (_) {}
+}
+ 
 class TupAnnouncementApp extends StatelessWidget {
   const TupAnnouncementApp({super.key});
-
+ 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -171,7 +263,7 @@ class TupAnnouncementApp extends StatelessWidget {
     );
   }
 }
-
+ 
 class Announcement {
   final String id;
   final String title;
@@ -189,7 +281,7 @@ class Announcement {
   final DateTime? start;
   final DateTime? end;
   final DateTime? createdAt;
-
+ 
   const Announcement({
     required this.id,
     required this.title,
@@ -208,22 +300,22 @@ class Announcement {
     this.end,
     this.createdAt,
   });
-
+ 
   factory Announcement.fromDoc(
       QueryDocumentSnapshot<Map<String, dynamic>> doc) {
     final data = doc.data();
     DateTime? ts(dynamic v) => v is Timestamp ? v.toDate() : null;
-
+ 
     String legacy = '${data['dates'] ?? ''}';
     if (legacy.isEmpty && data['date_range'] is Timestamp) {
       legacy = fmtDate((data['date_range'] as Timestamp).toDate());
     }
-
+ 
     final rawTags = data['tags'];
-
+ 
     String scope = '${data['scope'] ?? 'University'}';
     if (scope == 'College') scope = 'Department';
-
+ 
     return Announcement(
       id: doc.id,
       title: '${data['title'] ?? ''}',
@@ -243,17 +335,17 @@ class Announcement {
       createdAt: ts(data['createdAt']),
     );
   }
-
+ 
   bool get isExpired => hasEnded(start, end);
-
+ 
   bool get isScheduled => startsLater(start);
-
+ 
   bool get active => !isExpired;
-
+ 
   bool get isEvent => isEventCategory(category);
-
+ 
   String get status => isExpired ? 'EXPIRED' : 'ACTIVE';
-
+ 
   String get audience {
     if (scope == 'Department') {
       return department.isEmpty ? 'Department' : department;
@@ -263,7 +355,7 @@ class Announcement {
     }
     return 'University-wide';
   }
-
+ 
   String get dates {
     final s = start;
     final e = end;
@@ -280,19 +372,20 @@ class Announcement {
     return 'No date set';
   }
 }
-
+ 
 class UserPrefs {
   final bool done;
   final String department;
   final List<String> clubs;
-
+ 
   const UserPrefs({
     this.done = false,
     this.department = '',
     this.clubs = const [],
   });
-
+ 
   bool receives(Announcement a) {
+    if (kUrgentCategories.contains(a.category)) return true;
     if (a.scope == 'Department') {
       return a.department.isEmpty || a.department == department;
     }
@@ -301,7 +394,7 @@ class UserPrefs {
     }
     return true;
   }
-
+ 
   String get summary {
     final parts = <String>['University-wide'];
     if (department.isNotEmpty) parts.add(department);
@@ -309,7 +402,7 @@ class UserPrefs {
     return parts.join(' • ');
   }
 }
-
+ 
 Future<UserPrefs> loadUserPrefs() async {
   final p = await SharedPreferences.getInstance();
   return UserPrefs(
@@ -318,46 +411,53 @@ Future<UserPrefs> loadUserPrefs() async {
     clubs: p.getStringList('pref_clubs') ?? <String>[],
   );
 }
-
+ 
 Future<void> saveUserPrefs(UserPrefs prefs) async {
   final p = await SharedPreferences.getInstance();
   await p.setBool('pref_done', prefs.done);
   await p.setString('pref_department', prefs.department);
   await p.setStringList('pref_clubs', prefs.clubs);
 }
-
+ 
 class OfficerSession {
   final User? user;
   final bool ready;
   final bool approved;
   final bool approvalKnown;
   final String role;
-
+  final String secret;
+  final bool verified;
+ 
   const OfficerSession({
     this.user,
     this.ready = false,
     this.approved = false,
     this.approvalKnown = false,
     this.role = '',
+    this.secret = '',
+    this.verified = false,
   });
-
+ 
+  bool get isOfficer => user != null && approved && verified;
+ 
   bool canManage(Announcement a) {
     final u = user;
-    return u != null && approved && a.createdBy == u.uid;
+    return u != null && isOfficer && a.createdBy == u.uid;
   }
 }
-
-Future<void> openAnnouncementForm(
-    BuildContext context, User user, Announcement? existing) async {
+ 
+Future<void> openAnnouncementForm(BuildContext context, User user, String role,
+    Announcement? existing) async {
   final messenger = ScaffoldMessenger.of(context);
   final msg = await Navigator.of(context).push<String>(MaterialPageRoute(
-    builder: (_) => AnnouncementFormScreen(user: user, existing: existing),
+    builder: (_) =>
+        AnnouncementFormScreen(user: user, role: role, existing: existing),
   ));
   if (msg != null) {
     messenger.showSnackBar(SnackBar(content: Text(msg)));
   }
 }
-
+ 
 Future<void> confirmDeleteAnnouncement(
     BuildContext context, Announcement a) async {
   final messenger = ScaffoldMessenger.of(context);
@@ -389,7 +489,7 @@ Future<void> confirmDeleteAnnouncement(
     messenger.showSnackBar(SnackBar(content: Text('Could not delete: $e')));
   }
 }
-
+ 
 Widget announcementCardFor(
   BuildContext context,
   Announcement a,
@@ -401,57 +501,79 @@ Widget announcementCardFor(
   return AnnouncementCard(
     announcement: a,
     onTap: () => onOpen(a),
-    onEdit: manage ? () => openAnnouncementForm(context, user, a) : null,
+    onEdit:
+        manage ? () => openAnnouncementForm(context, user, session.role, a) : null,
     onDelete: manage ? () => confirmDeleteAnnouncement(context, a) : null,
   );
 }
-
+ 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
-
+ 
   @override
   State<MainShell> createState() => _MainShellState();
 }
-
+ 
 class _MainShellState extends State<MainShell> {
   int _tab = 0;
   OfficerSession _session = const OfficerSession();
   UserPrefs? _prefs;
   bool _freshLogin = false;
+  bool _mfaOk = false;
   StreamSubscription<User?>? _authSub;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _officerSub;
-
+  StreamSubscription<RemoteMessage>? _pushSub;
+ 
   late final Stream<QuerySnapshot<Map<String, dynamic>>> _stream =
       FirebaseFirestore.instance
           .collection('announcements')
           .orderBy('createdAt', descending: true)
           .snapshots(includeMetadataChanges: true);
-
+ 
   @override
   void initState() {
     super.initState();
     _authSub = FirebaseAuth.instance.userChanges().listen(_onAuth);
     _loadPrefs();
+    _initPush();
   }
-
+ 
   @override
   void dispose() {
     _authSub?.cancel();
     _officerSub?.cancel();
+    _pushSub?.cancel();
     super.dispose();
   }
-
+ 
+  Future<void> _initPush() async {
+    try {
+      await FirebaseMessaging.instance.requestPermission();
+      if (!mounted) return;
+      _pushSub = FirebaseMessaging.onMessage.listen((m) {
+        final n = m.notification;
+        if (!mounted || n == null) return;
+        final text = [n.title, n.body]
+            .whereType<String>()
+            .where((s) => s.isNotEmpty)
+            .join(': ');
+        if (text.isNotEmpty) showMsg(context, text);
+      });
+    } catch (_) {}
+  }
+ 
   Future<void> _loadPrefs() async {
     final p = await loadUserPrefs();
     if (!mounted) return;
     setState(() => _prefs = p);
+    if (p.done) syncPushTopics();
   }
-
+ 
   void _setPrefs(UserPrefs p) {
-    saveUserPrefs(p);
+    saveUserPrefs(p).then((_) => syncPushTopics());
     setState(() => _prefs = p);
   }
-
+ 
   void _editPrefs() {
     final current = _prefs ?? const UserPrefs();
     Navigator.of(context).push(MaterialPageRoute(
@@ -462,7 +584,7 @@ class _MainShellState extends State<MainShell> {
       ),
     ));
   }
-
+ 
   void _onAuth(User? user) {
     if (!mounted) return;
     if (user != null && _session.user?.uid == user.uid && _officerSub != null) {
@@ -471,29 +593,31 @@ class _MainShellState extends State<MainShell> {
           ready: true,
           approved: _session.approved,
           approvalKnown: _session.approvalKnown,
-          role: _session.role));
+          role: _session.role,
+          secret: _session.secret));
       return;
     }
     _officerSub?.cancel();
     _officerSub = null;
-
+    _mfaOk = false;
+ 
     if (user == null) {
       _freshLogin = false;
       setState(() => _session = const OfficerSession(ready: true));
       return;
     }
-
+ 
     if (_session.ready && _session.user == null) _freshLogin = true;
-
+ 
     if (!kRequireApproval) {
       setState(() => _session = OfficerSession(
           user: user, ready: true, approved: true, approvalKnown: true));
       _finishLogin();
       return;
     }
-
+ 
     setState(() => _session = OfficerSession(user: user, ready: true));
-
+ 
     _officerSub = FirebaseFirestore.instance
         .collection('officers')
         .doc(user.uid)
@@ -502,12 +626,14 @@ class _MainShellState extends State<MainShell> {
       if (!mounted) return;
       final approved = snap.data()?['approved'] == true;
       final role = '${snap.data()?['role'] ?? ''}';
+      final secret = '${snap.data()?['totpSecret'] ?? ''}';
       setState(() => _session = OfficerSession(
           user: user,
           ready: true,
           approved: approved,
           approvalKnown: true,
-          role: role));
+          role: role,
+          secret: secret));
       if (approved) _finishLogin();
     }, onError: (_) {
       if (!mounted) return;
@@ -515,7 +641,7 @@ class _MainShellState extends State<MainShell> {
           user: user, ready: true, approved: false, approvalKnown: true));
     });
   }
-
+ 
   void _finishLogin() {
     if (!_freshLogin || !mounted) return;
     _freshLogin = false;
@@ -523,13 +649,13 @@ class _MainShellState extends State<MainShell> {
     setState(() => _tab = 0);
     showMsg(context, 'Logged in as $email');
   }
-
+ 
   void _openDetails(Announcement announcement) {
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => AnnouncementDetailScreen(announcement: announcement),
     ));
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final prefs = _prefs;
@@ -547,7 +673,7 @@ class _MainShellState extends State<MainShell> {
         ),
       );
     }
-
+ 
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: _stream,
       builder: (context, snap) {
@@ -557,8 +683,16 @@ class _MainShellState extends State<MainShell> {
         final all = snap.hasData
             ? snap.data!.docs.map(Announcement.fromDoc).toList()
             : <Announcement>[];
-        final session = _session;
-
+        final base = _session;
+        final session = OfficerSession(
+            user: base.user,
+            ready: base.ready,
+            approved: base.approved,
+            approvalKnown: base.approvalKnown,
+            role: base.role,
+            secret: base.secret,
+            verified: _mfaOk);
+ 
         final pages = [
           AcademicsScreen(
             announcements: all,
@@ -567,12 +701,12 @@ class _MainShellState extends State<MainShell> {
             offline: offline,
             session: session,
             prefs: prefs,
-            onEditPrefs: _editPrefs,
             onOpen: _openDetails,
             onOpenNotifications: () => Navigator.push(
               context,
               MaterialPageRoute(
-                  builder: (_) => const NotificationPreferencesScreen()),
+                  builder: (_) => NotificationPreferencesScreen(
+                      onEditPrefs: _editPrefs)),
             ),
           ),
           EventsScreen(
@@ -586,9 +720,10 @@ class _MainShellState extends State<MainShell> {
           OfficerScreen(
             session: session,
             onRefresh: () => setState(() {}),
+            onVerified: () => setState(() => _mfaOk = true),
           ),
         ];
-
+ 
         return Scaffold(
           body: SafeArea(child: IndexedStack(index: _tab, children: pages)),
           bottomNavigationBar: NavigationBar(
@@ -621,34 +756,34 @@ class _MainShellState extends State<MainShell> {
     );
   }
 }
-
+ 
 class PersonalizationScreen extends StatefulWidget {
   final UserPrefs initial;
   final bool firstRun;
   final ValueChanged<UserPrefs> onSaved;
-
+ 
   const PersonalizationScreen({
     super.key,
     required this.initial,
     required this.firstRun,
     required this.onSaved,
   });
-
+ 
   @override
   State<PersonalizationScreen> createState() => _PersonalizationScreenState();
 }
-
+ 
 class _PersonalizationScreenState extends State<PersonalizationScreen> {
   late String _department;
   late Set<String> _clubs;
-
+ 
   @override
   void initState() {
     super.initState();
     _department = widget.initial.department;
     _clubs = widget.initial.clubs.toSet();
   }
-
+ 
   void _save() {
     widget.onSaved(UserPrefs(
       done: true,
@@ -657,17 +792,17 @@ class _PersonalizationScreenState extends State<PersonalizationScreen> {
     ));
     if (!widget.firstRun) Navigator.pop(context);
   }
-
+ 
   void _skip() {
     widget.onSaved(const UserPrefs(done: true));
   }
-
+ 
   Widget _chipLabel(String text, bool selected) => Text(text,
       style: TextStyle(
           color: selected ? Colors.white : ink,
           fontSize: 12,
           fontWeight: FontWeight.w600));
-
+ 
   @override
   Widget build(BuildContext context) {
     final content = ListView(
@@ -757,7 +892,7 @@ class _PersonalizationScreenState extends State<PersonalizationScreen> {
                 SizedBox(width: 8),
                 Expanded(
                     child: Text(
-                        'University-wide announcements are shown to everyone. The Events tab is open to everyone too, even for clubs you do not follow.',
+                        'University-wide announcements, class suspensions and emergency alerts are shown to everyone. The Events tab is open to everyone too, even for clubs you do not follow.',
                         style: TextStyle(
                             fontSize: 11,
                             color: burgundy,
@@ -782,9 +917,9 @@ class _PersonalizationScreenState extends State<PersonalizationScreen> {
           ),
       ],
     );
-
+ 
     if (widget.firstRun) return content;
-
+ 
     return Scaffold(
       appBar: AppBar(
         title: const Text('My department and organizations',
@@ -794,12 +929,13 @@ class _PersonalizationScreenState extends State<PersonalizationScreen> {
     );
   }
 }
-
-Widget scopeChips(String selected, ValueChanged<String> onSelected) {
+ 
+Widget scopeChips(String selected, ValueChanged<String> onSelected,
+    {bool includeAll = true}) {
   return Wrap(
     spacing: 8,
     runSpacing: 4,
-    children: ['All', ...kScopes].map((label) {
+    children: [if (includeAll) 'All', ...kScopes].map((label) {
       final isSelected = selected == label;
       return ChoiceChip(
         label: Text(label),
@@ -817,12 +953,12 @@ Widget scopeChips(String selected, ValueChanged<String> onSelected) {
     }).toList(),
   );
 }
-
+ 
 class StatusBadge extends StatelessWidget {
   final bool active;
   final bool scheduled;
   const StatusBadge({super.key, required this.active, this.scheduled = false});
-
+ 
   @override
   Widget build(BuildContext context) {
     final label = scheduled ? 'SCHEDULED' : (active ? 'ACTIVE' : 'EXPIRED');
@@ -842,11 +978,11 @@ class StatusBadge extends StatelessWidget {
     );
   }
 }
-
+ 
 class TagWrap extends StatelessWidget {
   final List<String> tags;
   const TagWrap({super.key, required this.tags});
-
+ 
   @override
   Widget build(BuildContext context) {
     return Wrap(
@@ -868,10 +1004,10 @@ class TagWrap extends StatelessWidget {
     );
   }
 }
-
+ 
 class OfflineBanner extends StatelessWidget {
   const OfflineBanner({super.key});
-
+ 
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -892,31 +1028,7 @@ class OfflineBanner extends StatelessWidget {
     );
   }
 }
-
-class OfficerModeBanner extends StatelessWidget {
-  const OfficerModeBanner({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-          color: paleRose, borderRadius: BorderRadius.circular(12)),
-      child: const Row(children: [
-        Icon(Icons.admin_panel_settings_outlined, size: 16, color: burgundy),
-        SizedBox(width: 8),
-        Expanded(
-            child: Text(
-                'Officer mode: you can edit or delete your own announcements.',
-                style: TextStyle(
-                    fontSize: 11,
-                    color: burgundy,
-                    fontWeight: FontWeight.w700))),
-      ]),
-    );
-  }
-}
-
+ 
 class AnnouncementCard extends StatelessWidget {
   final Announcement announcement;
   final VoidCallback onTap;
@@ -929,7 +1041,7 @@ class AnnouncementCard extends StatelessWidget {
     this.onEdit,
     this.onDelete,
   });
-
+ 
   Widget _cardAction(IconData icon, String label, VoidCallback onPressed) {
     return TextButton.icon(
       onPressed: onPressed,
@@ -946,14 +1058,13 @@ class AnnouncementCard extends StatelessWidget {
       ),
     );
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final a = announcement;
-    final color = categoryColor(a.category);
     final edit = onEdit;
     final del = onDelete;
-
+ 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       elevation: 0,
@@ -967,35 +1078,6 @@ class AnnouncementCard extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.all(15),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [
-              Container(
-                  width: 8,
-                  height: 8,
-                  decoration:
-                      BoxDecoration(color: color, shape: BoxShape.circle)),
-              const SizedBox(width: 7),
-              Expanded(
-                  child: Text(a.category.isEmpty ? 'General' : a.category,
-                      style: TextStyle(
-                          fontSize: 11,
-                          color: color,
-                          fontWeight: FontWeight.w700))),
-              StatusBadge(active: a.active, scheduled: a.isScheduled),
-            ]),
-            if (a.imageUrl.isNotEmpty) ...[
-              const SizedBox(height: 10),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.network(
-                  a.imageUrl,
-                  width: double.infinity,
-                  height: 170,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                ),
-              ),
-            ],
-            const SizedBox(height: 10),
             Text(a.title,
                 style: const TextStyle(
                     fontSize: 14,
@@ -1011,54 +1093,22 @@ class AnnouncementCard extends StatelessWidget {
                   child: Text('Effective: ${a.dates}',
                       style: const TextStyle(fontSize: 10, color: muted))),
             ]),
-            const SizedBox(height: 4),
-            Row(children: [
-              const Icon(Icons.account_balance_outlined,
-                  size: 12, color: muted),
-              const SizedBox(width: 5),
-              Expanded(
-                  child: Text(a.office,
-                      style: const TextStyle(fontSize: 10, color: muted))),
-            ]),
-            const SizedBox(height: 4),
-            Row(children: [
-              const Icon(Icons.groups_outlined, size: 12, color: muted),
-              const SizedBox(width: 5),
-              Expanded(
-                  child: Text(a.audience,
-                      style: const TextStyle(fontSize: 10, color: muted))),
-            ]),
-            if (a.tags.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              TagWrap(tags: a.tags),
+            if (edit != null || del != null) ...[
+              const SizedBox(height: 10),
+              Wrap(spacing: 6, children: [
+                if (edit != null)
+                  _cardAction(Icons.edit_outlined, 'Edit', edit),
+                if (del != null)
+                  _cardAction(Icons.delete_outline, 'Delete', del),
+              ]),
             ],
-            const SizedBox(height: 10),
-            Row(children: [
-              Expanded(
-                child: (edit == null && del == null)
-                    ? const SizedBox.shrink()
-                    : Wrap(spacing: 6, children: [
-                        if (edit != null)
-                          _cardAction(Icons.edit_outlined, 'Edit', edit),
-                        if (del != null)
-                          _cardAction(Icons.delete_outline, 'Delete', del),
-                      ]),
-              ),
-              const Text('Tap to expand',
-                  style: TextStyle(
-                      fontSize: 10,
-                      color: burgundy,
-                      fontWeight: FontWeight.w700)),
-              const SizedBox(width: 4),
-              const Icon(Icons.arrow_forward, size: 13, color: burgundy),
-            ]),
           ]),
         ),
       ),
     );
   }
 }
-
+ 
 class AcademicsScreen extends StatefulWidget {
   final List<Announcement> announcements;
   final bool loading;
@@ -1066,10 +1116,9 @@ class AcademicsScreen extends StatefulWidget {
   final bool offline;
   final OfficerSession session;
   final UserPrefs prefs;
-  final VoidCallback onEditPrefs;
   final ValueChanged<Announcement> onOpen;
   final VoidCallback onOpenNotifications;
-
+ 
   const AcademicsScreen({
     super.key,
     required this.announcements,
@@ -1078,116 +1127,36 @@ class AcademicsScreen extends StatefulWidget {
     this.offline = false,
     required this.session,
     required this.prefs,
-    required this.onEditPrefs,
     required this.onOpen,
     required this.onOpenNotifications,
   });
-
+ 
   @override
   State<AcademicsScreen> createState() => _AcademicsScreenState();
 }
-
+ 
 class _AcademicsScreenState extends State<AcademicsScreen> {
   final _search = TextEditingController();
-  String _filter = 'All';
-  String? _value;
-  String _scope = 'All';
-
-  static const _menuFilters = ['Category', 'Issuing Office', 'Status'];
-
+  String _scope = 'University';
+ 
   @override
   void dispose() {
     _search.dispose();
     super.dispose();
   }
-
-  List<String> _optionsFor(String filter) {
-    switch (filter) {
-      case 'Category':
-        return kAcademicCategories;
-      case 'Issuing Office':
-        final extra = widget.announcements
-            .map((a) => a.office)
-            .where((o) => o.isNotEmpty && !kOffices.contains(o))
-            .toSet()
-            .toList();
-        return [...kOffices, ...extra];
-      case 'Status':
-        return const ['Active', 'Expired'];
-      default:
-        return const [];
-    }
-  }
-
-  Widget _pill(String label, bool selected, {bool arrow = false}) {
-    final fg = selected ? Colors.white : ink;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      decoration: BoxDecoration(
-        color: selected ? burgundy : Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: selected ? burgundy : line),
-      ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Text(label,
-            style: TextStyle(
-                color: fg, fontSize: 12, fontWeight: FontWeight.w600)),
-        if (arrow) Icon(Icons.arrow_drop_down, size: 18, color: fg),
-      ]),
-    );
-  }
-
-  Widget _filterButtons() {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: [
-        GestureDetector(
-          onTap: () => setState(() {
-            _filter = 'All';
-            _value = null;
-          }),
-          child: _pill('All', _filter == 'All'),
-        ),
-        ..._menuFilters.map((label) {
-          return PopupMenuButton<String>(
-            color: Colors.white,
-            tooltip: '',
-            onSelected: (v) => setState(() {
-              _filter = label;
-              _value = v;
-            }),
-            itemBuilder: (_) => _optionsFor(label)
-                .map((o) => PopupMenuItem<String>(value: o, child: Text(o)))
-                .toList(),
-            child: _pill(label, _filter == label, arrow: true),
-          );
-        }),
-      ],
-    );
-  }
-
+ 
   @override
   Widget build(BuildContext context) {
     final q = _search.text.trim().toLowerCase();
     final session = widget.session;
     final prefs = widget.prefs;
-
+ 
     final filtered = widget.announcements.where((a) {
       if (a.isEvent) return false;
       final mine = session.canManage(a);
       if (a.isScheduled && !mine) return false;
       if (!mine && !prefs.receives(a)) return false;
-      if (_scope != 'All' && a.scope != _scope) return false;
-      final v = _value;
-      if (v != null) {
-        if (_filter == 'Category' && a.category != v) return false;
-        if (_filter == 'Issuing Office' && a.office != v) return false;
-        if (_filter == 'Status') {
-          if (v == 'Active' && !a.active) return false;
-          if (v == 'Expired' && a.active) return false;
-        }
-      }
+      if (a.scope != _scope) return false;
       if (q.isEmpty) return true;
       return a.title.toLowerCase().contains(q) ||
           a.category.toLowerCase().contains(q) ||
@@ -1196,7 +1165,7 @@ class _AcademicsScreenState extends State<AcademicsScreen> {
           a.tags.any((t) => t.toLowerCase().contains(q)) ||
           a.dates.toLowerCase().contains(q);
     }).toList();
-
+ 
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
       children: [
@@ -1223,37 +1192,8 @@ class _AcademicsScreenState extends State<AcademicsScreen> {
           ],
         ),
         const SizedBox(height: 14),
-        InkWell(
-          borderRadius: BorderRadius.circular(12),
-          onTap: widget.onEditPrefs,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: BoxDecoration(
-                color: paleRose, borderRadius: BorderRadius.circular(12)),
-            child: Row(children: [
-              const Icon(Icons.tune, size: 16, color: burgundy),
-              const SizedBox(width: 8),
-              Expanded(
-                  child: Text('Showing: ${prefs.summary}',
-                      style: const TextStyle(
-                          fontSize: 11,
-                          color: burgundy,
-                          fontWeight: FontWeight.w700))),
-              const Text('Edit',
-                  style: TextStyle(
-                      fontSize: 11,
-                      color: burgundy,
-                      fontWeight: FontWeight.w800)),
-            ]),
-          ),
-        ),
-        const SizedBox(height: 14),
         if (widget.offline) ...[
           const OfflineBanner(),
-          const SizedBox(height: 14),
-        ],
-        if (session.user != null && session.approved) ...[
-          const OfficerModeBanner(),
           const SizedBox(height: 14),
         ],
         TextField(
@@ -1265,9 +1205,8 @@ class _AcademicsScreenState extends State<AcademicsScreen> {
           ),
         ),
         const SizedBox(height: 14),
-        scopeChips(_scope, (v) => setState(() => _scope = v)),
-        const SizedBox(height: 10),
-        _filterButtons(),
+        scopeChips(_scope, (v) => setState(() => _scope = v),
+            includeAll: false),
         const SizedBox(height: 20),
         Row(
           children: [
@@ -1306,11 +1245,11 @@ class _AcademicsScreenState extends State<AcademicsScreen> {
     );
   }
 }
-
+ 
 class AnnouncementDetailScreen extends StatelessWidget {
   final Announcement announcement;
   const AnnouncementDetailScreen({super.key, required this.announcement});
-
+ 
   Future<void> _share(BuildContext context) async {
     final a = announcement;
     final text =
@@ -1320,7 +1259,7 @@ class AnnouncementDetailScreen extends StatelessWidget {
       showMsg(context, 'Announcement copied. Paste it anywhere to share.');
     }
   }
-
+ 
   Future<void> _saveToCalendar(BuildContext context) async {
     final a = announcement;
     final s = a.start ?? a.end;
@@ -1337,7 +1276,7 @@ class AnnouncementDetailScreen extends StatelessWidget {
       'dates': '${_ymd(s)}/${_ymd(endExclusive)}',
       'details': '${a.description}\n\nPosted by ${a.office}',
     });
-
+ 
     final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!opened) {
       await Clipboard.setData(ClipboardData(text: uri.toString()));
@@ -1346,7 +1285,7 @@ class AnnouncementDetailScreen extends StatelessWidget {
       }
     }
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final a = announcement;
@@ -1478,7 +1417,7 @@ class AnnouncementDetailScreen extends StatelessWidget {
     );
   }
 }
-
+ 
 class EventsScreen extends StatefulWidget {
   final List<Announcement> announcements;
   final bool loading;
@@ -1493,14 +1432,14 @@ class EventsScreen extends StatefulWidget {
     required this.session,
     required this.onOpen,
   });
-
+ 
   @override
   State<EventsScreen> createState() => _EventsScreenState();
 }
-
+ 
 class _EventsScreenState extends State<EventsScreen> {
   String _scope = 'All';
-
+ 
   @override
   Widget build(BuildContext context) {
     final session = widget.session;
@@ -1510,7 +1449,7 @@ class _EventsScreenState extends State<EventsScreen> {
       if (_scope != 'All' && a.scope != _scope) return false;
       return true;
     }).toList();
-
+ 
     return ListView(padding: const EdgeInsets.all(20), children: [
       const Text('Campus Events',
           style:
@@ -1567,14 +1506,14 @@ class _EventsScreenState extends State<EventsScreen> {
     ]);
   }
 }
-
+ 
 class HandbookSection {
   final String group;
   final String title;
   final String text;
   const HandbookSection(this.group, this.title, this.text);
 }
-
+ 
 IconData handbookIcon(String group) {
   switch (group) {
     case 'Academic Policies':
@@ -1587,26 +1526,26 @@ IconData handbookIcon(String group) {
       return Icons.info_outline;
   }
 }
-
+ 
 class HandbookScreen extends StatefulWidget {
   const HandbookScreen({super.key});
-
+ 
   @override
   State<HandbookScreen> createState() => _HandbookScreenState();
 }
-
+ 
 class _HandbookScreenState extends State<HandbookScreen> {
   final _search = TextEditingController();
   List<HandbookSection> _sections = [];
   bool _loading = true;
   String? _error;
-
+ 
   @override
   void initState() {
     super.initState();
     _load();
   }
-
+ 
   Future<void> _load() async {
     try {
       final raw = await rootBundle.loadString('assets/handbook.json');
@@ -1628,13 +1567,13 @@ class _HandbookScreenState extends State<HandbookScreen> {
       });
     }
   }
-
+ 
   @override
   void dispose() {
     _search.dispose();
     super.dispose();
   }
-
+ 
   String _snippet(HandbookSection s, String q) {
     final i = s.text.toLowerCase().indexOf(q);
     if (i < 0) return s.group;
@@ -1644,7 +1583,7 @@ class _HandbookScreenState extends State<HandbookScreen> {
     final piece = s.text.substring(start, end).replaceAll('\n', ' ');
     return '${start > 0 ? '...' : ''}$piece${end < s.text.length ? '...' : ''}';
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final q = _search.text.trim().toLowerCase();
@@ -1654,7 +1593,7 @@ class _HandbookScreenState extends State<HandbookScreen> {
           s.group.toLowerCase().contains(q) ||
           s.text.toLowerCase().contains(q);
     }).toList();
-
+ 
     final items = <Widget>[];
     String? lastGroup;
     for (final s in visible) {
@@ -1697,7 +1636,7 @@ class _HandbookScreenState extends State<HandbookScreen> {
         ),
       ));
     }
-
+ 
     return ListView(padding: const EdgeInsets.all(20), children: [
       const Text('Student Handbook',
           style:
@@ -1729,11 +1668,11 @@ class _HandbookScreenState extends State<HandbookScreen> {
     ]);
   }
 }
-
+ 
 class HandbookDetailScreen extends StatelessWidget {
   final HandbookSection section;
   const HandbookDetailScreen({super.key, required this.section});
-
+ 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1759,32 +1698,26 @@ class HandbookDetailScreen extends StatelessWidget {
     );
   }
 }
-
+ 
 class NotificationPreferencesScreen extends StatefulWidget {
-  const NotificationPreferencesScreen({super.key});
-
+  final VoidCallback onEditPrefs;
+  const NotificationPreferencesScreen({super.key, required this.onEditPrefs});
+ 
   @override
   State<NotificationPreferencesScreen> createState() =>
       _NotificationPreferencesScreenState();
 }
-
+ 
 class _NotificationPreferencesScreenState
     extends State<NotificationPreferencesScreen> {
-  final Map<String, bool> _settings = {
-    'Class Suspensions': true,
-    'Emergency Alerts': true,
-    'Campus Events': true,
-    'TUP Admin Office': true,
-    'Student Council': false,
-    'College Organizations': false,
-  };
-
+  final Map<String, bool> _settings = Map<String, bool>.of(kNotifDefaults);
+ 
   @override
   void initState() {
     super.initState();
     _load();
   }
-
+ 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
@@ -1794,20 +1727,22 @@ class _NotificationPreferencesScreenState
       }
     });
   }
-
+ 
   Future<void> _save() async {
     final prefs = await SharedPreferences.getInstance();
-
+ 
     for (final entry in _settings.entries) {
       await prefs.setBool('notif_${entry.key}', entry.value);
     }
-
+ 
+    await syncPushTopics();
+ 
     if (!mounted) return;
-
+ 
     Navigator.pop(context);
     showMsg(context, 'Preferences saved.');
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final categories = _settings.keys.toList();
@@ -1816,6 +1751,18 @@ class _NotificationPreferencesScreenState
           title: const Text('Notification Preferences',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700))),
       body: ListView(padding: const EdgeInsets.all(20), children: [
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.tune, color: burgundy),
+          title: const Text('Choose which pages to hear from',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700)),
+          subtitle: const Text('Your department and organizations',
+              style: TextStyle(fontSize: 10, color: muted)),
+          trailing: const Icon(Icons.chevron_right, color: burgundy),
+          onTap: widget.onEditPrefs,
+        ),
+        const Divider(color: line),
+        const SizedBox(height: 12),
         const Text('FILTER BY CATEGORY',
             style: TextStyle(
                 fontSize: 10,
@@ -1823,18 +1770,8 @@ class _NotificationPreferencesScreenState
                 color: muted,
                 fontWeight: FontWeight.w800)),
         const SizedBox(height: 8),
-        ...categories.take(3).map((name) =>
+        ...categories.map((name) =>
             _preferenceTile(name, 'Urgent campus updates and important notices')),
-        const SizedBox(height: 20),
-        const Text('FILTER BY CONTRIBUTOR',
-            style: TextStyle(
-                fontSize: 10,
-                letterSpacing: 1,
-                color: muted,
-                fontWeight: FontWeight.w800)),
-        const SizedBox(height: 8),
-        ...categories.skip(3).map((name) =>
-            _preferenceTile(name, 'Updates from this office or organization')),
         const SizedBox(height: 24),
         FilledButton(
           style: FilledButton.styleFrom(
@@ -1847,7 +1784,7 @@ class _NotificationPreferencesScreenState
       ]),
     );
   }
-
+ 
   Widget _preferenceTile(String name, String subtitle) => SwitchListTile(
         contentPadding: EdgeInsets.zero,
         title: Text(name,
@@ -1859,13 +1796,18 @@ class _NotificationPreferencesScreenState
         onChanged: (value) => setState(() => _settings[name] = value),
       );
 }
-
+ 
 class OfficerScreen extends StatelessWidget {
   final OfficerSession session;
   final VoidCallback onRefresh;
-  const OfficerScreen(
-      {super.key, required this.session, required this.onRefresh});
-
+  final VoidCallback onVerified;
+  const OfficerScreen({
+    super.key,
+    required this.session,
+    required this.onRefresh,
+    required this.onVerified,
+  });
+ 
   @override
   Widget build(BuildContext context) {
     if (!session.ready) {
@@ -1877,10 +1819,17 @@ class OfficerScreen extends StatelessWidget {
       return const Center(child: CircularProgressIndicator());
     }
     if (!session.approved) return PendingApprovalView(user: user);
+    if (!session.verified) {
+      return MfaView(
+        user: user,
+        secret: session.secret,
+        onVerified: onVerified,
+      );
+    }
     return OfficerAccountView(user: user, role: session.role);
   }
 }
-
+ 
 Future<void> ensureOfficerDoc(User user, {String? role}) async {
   final ref = FirebaseFirestore.instance.collection('officers').doc(user.uid);
   final snap = await ref.get();
@@ -1897,26 +1846,26 @@ Future<void> ensureOfficerDoc(User user, {String? role}) async {
     } catch (_) {}
   }
 }
-
+ 
 class OfficerLoginView extends StatefulWidget {
   const OfficerLoginView({super.key});
-
+ 
   @override
   State<OfficerLoginView> createState() => _OfficerLoginViewState();
 }
-
+ 
 class _OfficerLoginViewState extends State<OfficerLoginView> {
   final _email = TextEditingController();
   final _password = TextEditingController();
   bool _busy = false;
-
+ 
   @override
   void dispose() {
     _email.dispose();
     _password.dispose();
     super.dispose();
   }
-
+ 
   Future<void> _login() async {
     final email = _email.text.trim();
     final pass = _password.text;
@@ -1938,7 +1887,7 @@ class _OfficerLoginViewState extends State<OfficerLoginView> {
       if (mounted) setState(() => _busy = false);
     }
   }
-
+ 
   Future<void> _openSignUp() async {
     final messenger = ScaffoldMessenger.of(context);
     final msg = await Navigator.of(context).push<String>(
@@ -1948,7 +1897,7 @@ class _OfficerLoginViewState extends State<OfficerLoginView> {
       messenger.showSnackBar(SnackBar(content: Text(msg)));
     }
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     return ListView(padding: const EdgeInsets.all(22), children: [
@@ -2028,14 +1977,14 @@ class _OfficerLoginViewState extends State<OfficerLoginView> {
     ]);
   }
 }
-
+ 
 class SignUpScreen extends StatefulWidget {
   const SignUpScreen({super.key});
-
+ 
   @override
   State<SignUpScreen> createState() => _SignUpScreenState();
 }
-
+ 
 class _SignUpScreenState extends State<SignUpScreen> {
   final _email = TextEditingController();
   final _password = TextEditingController();
@@ -2043,7 +1992,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
   String _role = kRoles.last;
   bool _busy = false;
   String? _error;
-
+ 
   @override
   void dispose() {
     _email.dispose();
@@ -2051,11 +2000,11 @@ class _SignUpScreenState extends State<SignUpScreen> {
     _confirm.dispose();
     super.dispose();
   }
-
+ 
   Future<void> _submit() async {
     final email = _email.text.trim();
     final pass = _password.text;
-
+ 
     if (email.isEmpty || pass.isEmpty || _confirm.text.isEmpty) {
       setState(() => _error = 'Please fill in every field.');
       return;
@@ -2072,7 +2021,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
       setState(() => _error = 'The two passwords do not match.');
       return;
     }
-
+ 
     setState(() {
       _busy = true;
       _error = null;
@@ -2097,7 +2046,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
       if (mounted) setState(() => _busy = false);
     }
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -2208,22 +2157,22 @@ class _SignUpScreenState extends State<SignUpScreen> {
     );
   }
 }
-
+ 
 class PendingApprovalView extends StatefulWidget {
   final User user;
   const PendingApprovalView({super.key, required this.user});
-
+ 
   @override
   State<PendingApprovalView> createState() => _PendingApprovalViewState();
 }
-
+ 
 class _PendingApprovalViewState extends State<PendingApprovalView> {
   @override
   void initState() {
     super.initState();
     ensureOfficerDoc(widget.user).catchError((_) {});
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     return ListView(padding: const EdgeInsets.all(24), children: [
@@ -2255,12 +2204,164 @@ class _PendingApprovalViewState extends State<PendingApprovalView> {
     ]);
   }
 }
-
+ 
+class MfaView extends StatefulWidget {
+  final User user;
+  final String secret;
+  final VoidCallback onVerified;
+  const MfaView({
+    super.key,
+    required this.user,
+    required this.secret,
+    required this.onVerified,
+  });
+ 
+  @override
+  State<MfaView> createState() => _MfaViewState();
+}
+ 
+class _MfaViewState extends State<MfaView> {
+  final _code = TextEditingController();
+  final String _newSecret = newTotpSecret();
+  bool _busy = false;
+  String? _error;
+ 
+  bool get _setup => widget.secret.isEmpty;
+  String get _activeSecret => _setup ? _newSecret : widget.secret;
+ 
+  @override
+  void dispose() {
+    _code.dispose();
+    super.dispose();
+  }
+ 
+  Future<void> _submit() async {
+    if (!verifyTotp(_activeSecret, _code.text)) {
+      setState(() => _error = 'That code is not correct. Try again.');
+      return;
+    }
+    if (_setup) {
+      setState(() {
+        _busy = true;
+        _error = null;
+      });
+      try {
+        await FirebaseFirestore.instance
+            .collection('officers')
+            .doc(widget.user.uid)
+            .set({'totpSecret': _newSecret}, SetOptions(merge: true));
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _error = 'Could not save: $e';
+          });
+        }
+        return;
+      }
+    }
+    widget.onVerified();
+  }
+ 
+  @override
+  Widget build(BuildContext context) {
+    return ListView(padding: const EdgeInsets.all(24), children: [
+      const SizedBox(height: 30),
+      const Center(
+          child: CircleAvatar(
+              radius: 34,
+              backgroundColor: paleRose,
+              child: Icon(Icons.shield_outlined, size: 34, color: burgundy))),
+      const SizedBox(height: 18),
+      Text(_setup ? 'Set up two-factor login' : 'Two-factor login',
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+              fontSize: 22, fontWeight: FontWeight.w800, color: ink)),
+      const SizedBox(height: 8),
+      Text(
+          _setup
+              ? 'Open Google Authenticator (or any authenticator app), add a new code, choose "Enter a setup key", and type in the key below. Then enter the 6-digit code it shows.'
+              : 'Enter the 6-digit code from your authenticator app.',
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 12, color: muted, height: 1.5)),
+      if (_setup) ...[
+        const SizedBox(height: 18),
+        InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: () async {
+            await Clipboard.setData(ClipboardData(text: _newSecret));
+            if (context.mounted) showMsg(context, 'Setup key copied.');
+          },
+          child: Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+                color: paleRose, borderRadius: BorderRadius.circular(14)),
+            child: Row(children: [
+              Expanded(
+                  child: SelectableText(_newSecret,
+                      style: const TextStyle(
+                          fontSize: 16,
+                          letterSpacing: 2,
+                          fontWeight: FontWeight.w800,
+                          color: burgundy))),
+              const Icon(Icons.copy_outlined, color: burgundy, size: 20),
+            ]),
+          ),
+        ),
+      ],
+      const SizedBox(height: 18),
+      TextField(
+          controller: _code,
+          keyboardType: TextInputType.number,
+          maxLength: 6,
+          autocorrect: false,
+          enableSuggestions: false,
+          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+          onSubmitted: (_) {
+            if (!_busy) _submit();
+          },
+          decoration: const InputDecoration(
+              labelText: '6-digit code',
+              counterText: '',
+              prefixIcon: Icon(Icons.pin_outlined))),
+      if (_error != null) ...[
+        const SizedBox(height: 10),
+        Text(_error!,
+            style: const TextStyle(
+                fontSize: 12, color: burgundy, fontWeight: FontWeight.w600)),
+      ],
+      const SizedBox(height: 16),
+      FilledButton(
+        onPressed: _busy ? null : _submit,
+        style: FilledButton.styleFrom(
+            backgroundColor: burgundy,
+            padding: const EdgeInsets.symmetric(vertical: 15)),
+        child: _busy
+            ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: Colors.white))
+            : const Text('Verify', style: TextStyle(fontWeight: FontWeight.w800)),
+      ),
+      const SizedBox(height: 10),
+      OutlinedButton(
+        onPressed: () => FirebaseAuth.instance.signOut(),
+        style: OutlinedButton.styleFrom(
+            foregroundColor: burgundy,
+            side: const BorderSide(color: burgundy),
+            padding: const EdgeInsets.symmetric(vertical: 14)),
+        child: const Text('Log out'),
+      ),
+    ]);
+  }
+}
+ 
 class OfficerAccountView extends StatelessWidget {
   final User user;
   final String role;
   const OfficerAccountView({super.key, required this.user, this.role = ''});
-
+ 
   @override
   Widget build(BuildContext context) {
     return ListView(padding: const EdgeInsets.all(22), children: [
@@ -2328,7 +2429,7 @@ class OfficerAccountView extends StatelessWidget {
       ),
       const SizedBox(height: 20),
       FilledButton.icon(
-        onPressed: () => openAnnouncementForm(context, user, null),
+        onPressed: () => openAnnouncementForm(context, user, role, null),
         icon: const Icon(Icons.add),
         label: const Text('Publish announcement',
             style: TextStyle(fontWeight: FontWeight.w800)),
@@ -2353,24 +2454,27 @@ class OfficerAccountView extends StatelessWidget {
     ]);
   }
 }
-
+ 
 class AnnouncementFormScreen extends StatefulWidget {
   final User user;
+  final String role;
   final Announcement? existing;
   const AnnouncementFormScreen(
-      {super.key, required this.user, this.existing});
-
+      {super.key, required this.user, this.role = '', this.existing});
+ 
   @override
   State<AnnouncementFormScreen> createState() =>
       _AnnouncementFormScreenState();
 }
-
+ 
 class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
   late final TextEditingController _title;
   late final TextEditingController _description;
   late final TextEditingController _office;
   late final TextEditingController _attachment;
-  late final TextEditingController _tags;
+  late final List<String> _scopes;
+  late final List<String> _baseCategories;
+  late String _type;
   late String _category;
   late String _scope;
   late String _department;
@@ -2378,25 +2482,51 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
   DateTime? _start;
   DateTime? _end;
   bool _saving = false;
-
+ 
   XFile? _selectedImage;
   Uint8List? _selectedImageBytes;
   String _currentImageUrl = '';
-
+ 
+  List<String> get _categories => _baseCategories
+      .where((c) => _type == 'Event' ? isEventCategory(c) : !isEventCategory(c))
+      .toList();
+ 
+  List<String> get _availableTypes => [
+        if (_baseCategories.any((c) => !isEventCategory(c))) 'Academics',
+        if (_baseCategories.any(isEventCategory)) 'Event',
+      ];
+ 
   @override
   void initState() {
     super.initState();
     final e = widget.existing;
+    final role = widget.role;
+    final baseScopes = kRoleScopes[role] ?? kScopes;
+    final baseCategories = kRoleCategories[role] ?? kCategories;
+    _scopes = (e != null &&
+            kScopes.contains(e.scope) &&
+            !baseScopes.contains(e.scope))
+        ? [...baseScopes, e.scope]
+        : baseScopes;
+    _baseCategories = (e != null &&
+            kCategories.contains(e.category) &&
+            !baseCategories.contains(e.category))
+        ? [...baseCategories, e.category]
+        : baseCategories;
+    final hasAcademics = _baseCategories.any((c) => !isEventCategory(c));
+    _type = e != null
+        ? (e.isEvent ? 'Event' : 'Academics')
+        : (hasAcademics ? 'Academics' : 'Event');
     _currentImageUrl = e?.imageUrl ?? '';
     _title = TextEditingController(text: e?.title ?? '');
     _description = TextEditingController(text: e?.description ?? '');
-    _office = TextEditingController(text: e?.office ?? 'TUP Admin');
+    _office = TextEditingController(
+        text: e?.office ?? (kRoleOffices[role] ?? 'TUP Admin'));
     _attachment = TextEditingController(text: e?.attachment ?? '');
-    _tags = TextEditingController(text: e?.tags.join(', ') ?? '');
-    _category = (e != null && kCategories.contains(e.category))
+    _category = (e != null && _categories.contains(e.category))
         ? e.category
-        : kCategories.first;
-    _scope = (e != null && kScopes.contains(e.scope)) ? e.scope : kScopes.first;
+        : _categories.first;
+    _scope = (e != null && _scopes.contains(e.scope)) ? e.scope : _scopes.first;
     _department = (e != null && kDepartments.contains(e.department))
         ? e.department
         : kDepartments.first;
@@ -2404,7 +2534,7 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     _start = e?.start;
     _end = e?.end;
   }
-
+ 
   Future<void> _pickImage() async {
     try {
       final picked = await ImagePicker().pickImage(
@@ -2412,11 +2542,11 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
         imageQuality: 80,
         maxWidth: 1600,
       );
-
+ 
       if (picked == null) return;
-
+ 
       final bytes = await picked.readAsBytes();
-
+ 
       if (bytes.length > 5 * 1024 * 1024) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -2427,9 +2557,9 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
         }
         return;
       }
-
+ 
       if (!mounted) return;
-
+ 
       setState(() {
         _selectedImage = picked;
         _selectedImageBytes = bytes;
@@ -2442,17 +2572,16 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       }
     }
   }
-
+ 
   @override
   void dispose() {
     _title.dispose();
     _description.dispose();
     _office.dispose();
     _attachment.dispose();
-    _tags.dispose();
     super.dispose();
   }
-
+ 
   Future<void> _pickDate(bool isStart) async {
     final initial = (isStart ? _start : _end) ?? _start ?? DateTime.now();
     final picked = await showDatePicker(
@@ -2471,10 +2600,10 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       });
     }
   }
-
+ 
   String _dateLabel(DateTime? date) =>
       date == null ? 'Select date' : fmtDate(date);
-
+ 
   String _dateSummary() {
     final s = _start;
     final e = _end;
@@ -2483,13 +2612,7 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     if (e != null) return 'Until ${fmtDate(e)}';
     return 'No date set';
   }
-
-  List<String> _parsedTags() => _tags.text
-      .split(',')
-      .map((t) => t.trim())
-      .where((t) => t.isNotEmpty)
-      .toList();
-
+ 
   String _statusPreview() {
     final s = _start;
     if (hasEnded(s, _end)) {
@@ -2500,21 +2623,20 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
     }
     return 'This will show as ACTIVE.';
   }
-
+ 
   String _audienceText() {
     if (_scope == 'Department') return 'Department – $_department';
     if (_scope == 'Clubs') return 'Clubs – $_club';
     return 'University-wide';
   }
-
+ 
   Future<bool> _confirmPublish() async {
     final editing = widget.existing != null;
-    final tags = _parsedTags();
     final office = _office.text.trim().isEmpty
         ? 'TUP Contributor'
         : _office.text.trim();
     final tab = isEventCategory(_category) ? 'Events' : 'Academics';
-
+ 
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -2541,10 +2663,6 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
               Text('Issuing office: $office'),
               const SizedBox(height: 4),
               Text('Dates: ${_dateSummary()}'),
-              if (tags.isNotEmpty) ...[
-                const SizedBox(height: 4),
-                Text('Tags: ${tags.map((t) => '#$t').join(' ')}'),
-              ],
               const SizedBox(height: 10),
               Text(
                 _statusPreview(),
@@ -2572,30 +2690,35 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
         ],
       ),
     );
-
+ 
     return ok == true && mounted;
   }
-
+ 
   Future<void> _save() async {
     if (_title.text.trim().isEmpty ||
         _description.text.trim().isEmpty) {
       showMsg(context, 'Enter a title and description first.');
       return;
     }
-
+ 
     final s = _start;
     final e = _end;
-
-    if (s != null && e != null && e.isBefore(s)) {
+ 
+    if (s == null || e == null) {
+      showMsg(context, 'Please select both a start date and an end date.');
+      return;
+    }
+ 
+    if (e.isBefore(s)) {
       showMsg(context, 'The end date must be on or after the start date.');
       return;
     }
-
+ 
     final confirmed = await _confirmPublish();
     if (!confirmed) return;
-
+ 
     setState(() => _saving = true);
-
+ 
     final data = <String, dynamic>{
       'title': _title.text.trim(),
       'category': _category,
@@ -2607,40 +2730,39 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
           : _office.text.trim(),
       'description': _description.text.trim(),
       'attachment_link': _attachment.text.trim(),
-      'tags': _parsedTags(),
-      'start_date': s == null ? null : Timestamp.fromDate(s),
-      'end_date': e == null ? null : Timestamp.fromDate(e),
+      'start_date': Timestamp.fromDate(s),
+      'end_date': Timestamp.fromDate(e),
       'updatedAt': Timestamp.now(),
     };
-
+ 
     Reference? uploadedImageRef;
-
+ 
     try {
       String imageUrl = _currentImageUrl;
-
+ 
       if (_selectedImageBytes != null && _selectedImage != null) {
         final extension = _selectedImage!.name.split('.').last.toLowerCase();
         final safeExtension = extension == 'png' ? 'png' : 'jpg';
         final contentType = safeExtension == 'png' ? 'image/png' : 'image/jpeg';
-
+ 
         uploadedImageRef = FirebaseStorage.instance.ref().child(
           'announcement_images/${widget.user.uid}_'
           '${DateTime.now().millisecondsSinceEpoch}.$safeExtension',
         );
-
+ 
         final uploadTask = await uploadedImageRef.putData(
           _selectedImageBytes!,
           SettableMetadata(contentType: contentType),
         );
-
+ 
         imageUrl = await uploadTask.ref.getDownloadURL();
       }
-
+ 
       data['imageUrl'] = imageUrl;
-
+ 
       final col = FirebaseFirestore.instance.collection('announcements');
       final existing = widget.existing;
-
+ 
       if (existing == null) {
         await col.add({
           ...data,
@@ -2652,9 +2774,9 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       } else {
         await col.doc(existing.id).update(data);
       }
-
+ 
       if (!mounted) return;
-
+ 
       Navigator.pop(
         context,
         existing == null
@@ -2667,14 +2789,14 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
           await uploadedImageRef.delete();
         } catch (_) {}
       }
-
+ 
       if (!mounted) return;
-
+ 
       setState(() => _saving = false);
       showMsg(context, 'Could not save: $err');
     }
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     final editing = widget.existing != null;
@@ -2686,6 +2808,30 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       body: ListView(
           padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
           children: [
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: _availableTypes.map((t) {
+                final selected = _type == t;
+                return ChoiceChip(
+                  label: Text(t == 'Academics' ? 'Academic Announcement' : 'Event'),
+                  selected: selected,
+                  showCheckmark: false,
+                  selectedColor: burgundy,
+                  backgroundColor: Colors.white,
+                  side: BorderSide(color: selected ? burgundy : line),
+                  labelStyle: TextStyle(
+                      color: selected ? Colors.white : ink,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600),
+                  onSelected: (_) => setState(() {
+                    _type = t;
+                    _category = _categories.first;
+                  }),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 16),
             const Text('Announcement Title',
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
             const SizedBox(height: 7),
@@ -2699,14 +2845,14 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
             const SizedBox(height: 7),
             DropdownButtonFormField<String>(
               value: _category,
-              items: kCategories
+              items: _categories
                   .map((c) => DropdownMenuItem(value: c, child: Text(c)))
                   .toList(),
               onChanged: (v) => setState(() => _category = v ?? _category),
             ),
             const SizedBox(height: 6),
             Text(
-                isEventCategory(_category)
+                _type == 'Event'
                     ? 'This goes to the Events tab and is shown to everyone.'
                     : 'This goes to the Academics tab and only reaches the chosen audience.',
                 style: const TextStyle(fontSize: 10, color: muted)),
@@ -2716,7 +2862,7 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
             const SizedBox(height: 7),
             DropdownButtonFormField<String>(
               value: _scope,
-              items: kScopes
+              items: _scopes
                   .map((c) => DropdownMenuItem(value: c, child: Text(c)))
                   .toList(),
               onChanged: (v) => setState(() => _scope = v ?? _scope),
@@ -2769,21 +2915,11 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
                 decoration: const InputDecoration(
                     hintText: 'Enter announcement details')),
             const SizedBox(height: 16),
-            const Text('Event tags (optional)',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 7),
-            TextField(
-                controller: _tags,
-                onChanged: (_) => setState(() {}),
-                decoration: const InputDecoration(
-                    hintText: 'Separate with commas, e.g. enrollment, sports',
-                    prefixIcon: Icon(Icons.tag))),
-            const SizedBox(height: 16),
             const Text('Effective Date Range',
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
             const Text(
-                'Shows from the start date and turns EXPIRED after the end date. Leave the end date blank for a one-day announcement, or leave both blank to keep it active.',
+                'Required. For a one-day post, use the same start and end date. It turns EXPIRED after the end date.',
                 style: TextStyle(fontSize: 10, color: muted)),
             const SizedBox(height: 8),
             Row(children: [
@@ -2821,17 +2957,6 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
                             fontWeight: FontWeight.w600))),
               ]),
             ),
-            if (_start != null || _end != null)
-              Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton(
-                    onPressed: () => setState(() {
-                          _start = null;
-                          _end = null;
-                        }),
-                    child: const Text('Clear dates',
-                        style: TextStyle(color: burgundy, fontSize: 12))),
-              ),
             const SizedBox(height: 12),
             const Text(
               'Announcement Photo (optional)',
