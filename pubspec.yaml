@@ -43,6 +43,7 @@ dependencies:
   firebase_storage: ^14.0.1
   firebase_messaging: ^17.1.0
   otp: ^3.2.1
+  http: ^1.2.0
 
 dev_dependencies:
   flutter_test:
