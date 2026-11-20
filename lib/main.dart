@@ -11,7 +11,6 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'firebase_options.dart';
-import 'package:firebase_storage/firebase_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:otp/otp.dart';
@@ -209,6 +208,30 @@ Future<void> notifyEveryone(User user, String announcementId) async {
   } catch (_) {}
 }
 
+// Free image hosting (Cloudinary). Fill in your own values.
+const kCloudinaryCloud = 'wrl7qurb';
+const kCloudinaryPreset = 'tup_announcements';
+
+Future<String> uploadAnnouncementImage(Uint8List bytes, String fileName) async {
+  final request = http.MultipartRequest(
+    'POST',
+    Uri.parse('https://api.cloudinary.com/v1_1/$kCloudinaryCloud/image/upload'),
+  )
+    ..fields['upload_preset'] = kCloudinaryPreset
+    ..files.add(http.MultipartFile.fromBytes('file', bytes, filename: fileName));
+
+  final streamed = await request.send().timeout(const Duration(seconds: 60));
+  final res = await http.Response.fromStream(streamed);
+  if (res.statusCode != 200) {
+    throw Exception('Photo upload failed (${res.statusCode}): ${res.body}');
+  }
+  final url = (jsonDecode(res.body) as Map<String, dynamic>)['secure_url'];
+  if (url is! String || url.isEmpty) {
+    throw Exception('Photo upload returned no link.');
+  }
+  return url;
+}
+
 String topicSlug(String s) => s
     .toLowerCase()
     .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
@@ -320,9 +343,8 @@ class Announcement {
     this.createdAt,
   });
  
-  factory Announcement.fromDoc(
-      QueryDocumentSnapshot<Map<String, dynamic>> doc) {
-    final data = doc.data();
+  factory Announcement.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data() ?? <String, dynamic>{};
     DateTime? ts(dynamic v) => v is Timestamp ? v.toDate() : null;
  
     String legacy = '${data['dates'] ?? ''}';
@@ -542,6 +564,7 @@ class _MainShellState extends State<MainShell> {
   StreamSubscription<User?>? _authSub;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _officerSub;
   StreamSubscription<RemoteMessage>? _pushSub;
+  StreamSubscription<RemoteMessage>? _openedSub;
  
   late final Stream<QuerySnapshot<Map<String, dynamic>>> _stream =
       FirebaseFirestore.instance
@@ -554,6 +577,7 @@ class _MainShellState extends State<MainShell> {
     super.initState();
     _authSub = FirebaseAuth.instance.userChanges().listen(_onAuth);
     _loadPrefs();
+    _initPushTaps();
     _initPush();
   }
  
@@ -562,9 +586,37 @@ class _MainShellState extends State<MainShell> {
     _authSub?.cancel();
     _officerSub?.cancel();
     _pushSub?.cancel();
+    _openedSub?.cancel();
     super.dispose();
   }
  
+  // Tapping a notification opens that announcement.
+  Future<void> _initPushTaps() async {
+    try {
+      // App was in the background.
+      _openedSub = FirebaseMessaging.onMessageOpenedApp.listen(_openFromPush);
+      // App was closed completely.
+      final first = await FirebaseMessaging.instance.getInitialMessage();
+      if (first != null) _openFromPush(first);
+    } catch (_) {}
+  }
+
+  Future<void> _openFromPush(RemoteMessage m) async {
+    final id = m.data['announcementId'];
+    if (id is! String || id.isEmpty) return;
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('announcements')
+          .doc(id)
+          .get();
+      if (!mounted || !snap.exists) return;
+      final announcement = Announcement.fromDoc(snap);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _openDetails(announcement);
+      });
+    } catch (_) {}
+  }
+
   Future<void> _initPush() async {
     try {
       await FirebaseMessaging.instance.requestPermission();
@@ -577,7 +629,11 @@ class _MainShellState extends State<MainShell> {
             .whereType<String>()
             .where((s) => s.isNotEmpty)
             .join(': ');
-        if (text.isNotEmpty) showMsg(context, text);
+        if (text.isEmpty) return;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(text),
+          action: SnackBarAction(label: 'VIEW', onPressed: () => _openFromPush(m)),
+        ));
       });
     } catch (_) {}
   }
@@ -2755,29 +2811,14 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       'updatedAt': Timestamp.now(),
     };
  
-    Reference? uploadedImageRef;
- 
     try {
       String imageUrl = _currentImageUrl;
  
       if (_selectedImageBytes != null && _selectedImage != null) {
-        final extension = _selectedImage!.name.split('.').last.toLowerCase();
-        final safeExtension = extension == 'png' ? 'png' : 'jpg';
-        final contentType = safeExtension == 'png' ? 'image/png' : 'image/jpeg';
- 
-        uploadedImageRef = FirebaseStorage.instance.ref().child(
-          'announcement_images/${widget.user.uid}_'
-          '${DateTime.now().millisecondsSinceEpoch}.$safeExtension',
-        );
- 
-        final uploadTask = await uploadedImageRef.putData(
-          _selectedImageBytes!,
-          SettableMetadata(contentType: contentType),
-        );
- 
-        imageUrl = await uploadTask.ref.getDownloadURL();
+        imageUrl = await uploadAnnouncementImage(
+            _selectedImageBytes!, _selectedImage!.name);
       }
- 
+
       data['imageUrl'] = imageUrl;
  
       final col = FirebaseFirestore.instance.collection('announcements');
@@ -2805,12 +2846,6 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
             : 'Announcement updated.',
       );
     } catch (err) {
-      if (uploadedImageRef != null) {
-        try {
-          await uploadedImageRef.delete();
-        } catch (_) {}
-      }
- 
       if (!mounted) return;
  
       setState(() => _saving = false);
