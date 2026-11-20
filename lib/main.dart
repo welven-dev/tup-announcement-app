@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'firebase_options.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:otp/otp.dart';
  
@@ -190,6 +191,24 @@ bool verifyTotp(String secret, String input) {
   return false;
 }
  
+const kPushWorkerUrl = 'https://tup-push.espanawelven44.workers.dev';
+
+Future<void> notifyEveryone(User user, String announcementId) async {
+  try {
+    final token = await user.getIdToken();
+    await http
+        .post(
+          Uri.parse(kPushWorkerUrl),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $token',
+          },
+          body: jsonEncode({'announcementId': announcementId}),
+        )
+        .timeout(const Duration(seconds: 15));
+  } catch (_) {}
+}
+
 String topicSlug(String s) => s
     .toLowerCase()
     .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
@@ -549,6 +568,7 @@ class _MainShellState extends State<MainShell> {
   Future<void> _initPush() async {
     try {
       await FirebaseMessaging.instance.requestPermission();
+      await FirebaseMessaging.instance.subscribeToTopic('uni');
       if (!mounted) return;
       _pushSub = FirebaseMessaging.onMessage.listen((m) {
         final n = m.notification;
@@ -2764,13 +2784,14 @@ class _AnnouncementFormScreenState extends State<AnnouncementFormScreen> {
       final existing = widget.existing;
  
       if (existing == null) {
-        await col.add({
+        final ref = await col.add({
           ...data,
           'status': 'active',
           'createdAt': Timestamp.now(),
           'createdBy': widget.user.uid,
           'createdByEmail': widget.user.email,
         });
+                notifyEveryone(widget.user, ref.id);
       } else {
         await col.doc(existing.id).update(data);
       }
